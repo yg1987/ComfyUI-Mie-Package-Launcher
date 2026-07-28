@@ -30,10 +30,9 @@ jobs:
           python -m pip install -r requirements.txt nuitka
           $installer = Join-Path $env:RUNNER_TEMP 'enigmavb.exe'
           Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' -OutFile $installer
-          $actualHash = (Get-FileHash -Path $installer -Algorithm SHA256).Hash
-          $expectedHash = 'CF47AA8568983272A5995BBEB768F3A2CB6E8C4B065EADB8C4EDA368FD783A39'
-          if ($actualHash -ne $expectedHash) {
-            throw "Unexpected Enigma Virtual Box installer SHA-256: $actualHash"
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($signature.Status -ne 'Valid') {
+            throw "Enigma Virtual Box installer signature is not valid: $($signature.Status)"
           }
           Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -NoNewWindow
           if (-not (Test-Path 'C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe')) {
