@@ -9,6 +9,7 @@ from .models_page import ModelsPage
 from .about_me_page import AboutMePage
 from .about_comfyui_page import AboutComfyUIPage
 from .about_launcher_page import AboutLauncherPage
+from .plugin_page import PluginPage
 
 __all__ = [
     'BasePage',
@@ -18,4 +19,5 @@ __all__ = [
     'AboutMePage',
     'AboutComfyUIPage',
     'AboutLauncherPage',
+    'PluginPage',
 ]

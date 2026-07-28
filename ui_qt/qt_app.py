@@ -34,6 +34,7 @@ from ui_qt.widgets.dialog_helper import DialogHelper
 from ui_qt.theme_styles import ThemeStyles, ThemeColors
 from ui_qt.pages.launch_page import LaunchPage
 from ui_qt.pages.version_page import VersionPage
+from ui_qt.pages.plugin_page import PluginPage
 from ui_qt.pages.models_page import ModelsPage
 from ui_qt.pages.about_me_page import AboutMePage
 from ui_qt.pages.about_comfyui_page import AboutComfyUIPage
@@ -2072,6 +2073,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         btns = {
             "launch": NavBtn("🚀 启动与更新"),
             "version": NavBtn("🧬 内核版本管理"),
+            "plugins": NavBtn("🧩 插件管理"),
             "models": NavBtn("📂 外置模型库管理"),
             "about": NavBtn("👤 关于我"),
             "comfyui": NavBtn("📚 关于 ComfyUI"),
@@ -2306,6 +2308,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         except Exception:
             pass
         page_version = VersionPage(app=self, theme_manager=self.theme_manager)
+        page_plugins = PluginPage(app=self, theme_manager=self.theme_manager)
         page_models = ModelsPage(app=self, theme_manager=self.theme_manager)
         page_about_me = AboutMePage(theme_manager=self.theme_manager)
         page_about_comfyui = AboutComfyUIPage(theme_manager=self.theme_manager)
@@ -2317,6 +2320,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         self._new_pages = {
             "launch": page_launch,
             "version": page_version,
+            "plugins": page_plugins,
             "models": page_models,
             "about": page_about_me,
             "comfyui": page_about_comfyui,
@@ -2389,6 +2393,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
         content.addWidget(wrap_in_scroll(page_launch))
         content.addWidget(wrap_in_scroll(page_version))
+        content.addWidget(wrap_in_scroll(page_plugins))
         content.addWidget(wrap_in_scroll(page_models))
         content.addWidget(wrap_in_scroll(page_about_me))
         content.addWidget(wrap_in_scroll(page_about_comfyui))
@@ -2397,6 +2402,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         pages = {
             "launch": page_launch,
             "version": page_version,
+            "plugins": page_plugins,
             "models": page_models,
             "about": page_about_me,
             "comfyui": page_about_comfyui,
