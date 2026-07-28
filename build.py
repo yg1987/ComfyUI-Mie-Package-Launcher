@@ -3,9 +3,10 @@ ComfyUI启动器 一键构建脚本
 整合 Nuitka 编译 + Enigma Virtual Box 封包
 
 用法:
-  python build.py                     # 使用当前版本构建
+  python build.py                     # 本机构建测试包（文件名带 _test）
   python build.py --version v1.0.10   # 设置版本号并构建
-  python build.py --test              # 测试通道
+  python build.py --release           # 构建正式发布包（文件名不带 _test）
+  python build.py --test              # 显式构建测试包（兼容旧调用）
   python build.py --evb-only          # 跳过 Nuitka，仅封包
 """
 
@@ -16,6 +17,7 @@ import time
 import shutil
 import subprocess
 import argparse
+from xml.sax.saxutils import escape as xml_escape
 
 # Enigma Virtual Box 安装路径搜索列表
 ENIGMA_SEARCH_PATHS = [
@@ -45,12 +47,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description='ComfyUI启动器 一键构建脚本')
     parser.add_argument('--version', type=str, default=None,
                         help='设置版本号 (如 v1.0.10)，不指定则使用当前版本')
-    parser.add_argument('--test', action='store_true',
-                        help='构建测试通道版本')
+    parser.add_argument('--test', dest='test', action='store_true', default=True,
+                        help='构建测试通道版本（默认，文件名带 _test）')
+    parser.add_argument('--release', dest='test', action='store_false',
+                        help='构建正式发布版本（仅 CI/发布使用，文件名不带 _test）')
     parser.add_argument('--evb-only', action='store_true',
                         help='跳过 Nuitka 编译，仅执行 Enigma 打包')
     parser.add_argument('--enigma-path', type=str, default=None,
                         help='指定 enigmavbconsole.exe 路径')
+    parser.add_argument('--python-path', type=str, default=None,
+                        help='指定用于 Nuitka 编译的 Python 路径，优先于项目 .venv')
     return parser.parse_args()
 
 
@@ -127,8 +133,14 @@ def get_dist_dir(is_test):
 
 
 
-def find_python_exe():
-    """查找虚拟环境中的 Python（项目根 .venv 优先）。从 build_exe_v2 迁过来。"""
+def find_python_exe(custom_path=None):
+    """查找用于构建的 Python（显式路径优先，其次项目根 .venv）。"""
+    if custom_path:
+        python_path = os.path.abspath(custom_path)
+        if os.path.isfile(python_path):
+            return python_path
+        print(f"[错误] 指定的构建 Python 不存在: {python_path}")
+        sys.exit(1)
     project_dir = get_project_dir()
     venv_python = os.path.join(project_dir, ".venv", "Scripts", "python.exe")
     if os.path.exists(venv_python):
@@ -170,14 +182,14 @@ def update_build_parameters(is_test=False):
         print(f"[版本] 写入忽略: {e}")
 
     return params
-def step_nuitka_compile(is_test):
+def step_nuitka_compile(is_test, python_path=None):
     """Step 1: Nuitka 编译（含构建参数 + dist 清理 + 编译后改名）。
 
     从 build_exe_v2.build_nuitka 内联过来；之前 build.py 跨文件 import 调用，
     现在 build.py 自包含，建 build_exe_v2.py / build_exe.py 可以下线。
     """
     project_dir = get_project_dir()
-    python_exe = find_python_exe()
+    python_exe = find_python_exe(python_path)
 
     print(f"[环境] Python: {python_exe}")
     print(f"[环境] 项目目录: {project_dir}")
@@ -334,6 +346,82 @@ def step_nuitka_compile(is_test):
         sys.exit(1)
 
     return dist_dir
+def _enigma_file_entry(file_path, indent):
+    """Return one Enigma Virtual Box file entry for a current build artifact."""
+    name = xml_escape(os.path.basename(file_path))
+    source = xml_escape(os.path.abspath(file_path))
+    return [
+        f"{indent}<File>",
+        f"{indent}  <Type>2</Type>",
+        f"{indent}  <Name>{name}</Name>",
+        f"{indent}  <File>{source}</File>",
+        f"{indent}  <ActiveX>False</ActiveX>",
+        f"{indent}  <ActiveXInstall>False</ActiveXInstall>",
+        f"{indent}  <Action>0</Action>",
+        f"{indent}  <OverwriteDateTime>False</OverwriteDateTime>",
+        f"{indent}  <OverwriteAttributes>False</OverwriteAttributes>",
+        f"{indent}  <PassCommandLine>False</PassCommandLine>",
+        f"{indent}  <HideFromDialogs>0</HideFromDialogs>",
+        f"{indent}</File>",
+    ]
+
+
+def _enigma_folder_entry(folder_path, indent, is_default_folder=False):
+    """Build the nested Enigma XML entry tree from the actual Nuitka output."""
+    name = "%DEFAULT FOLDER%" if is_default_folder else os.path.basename(folder_path)
+    lines = [
+        f"{indent}<File>",
+        f"{indent}  <Type>3</Type>",
+        f"{indent}  <Name>{xml_escape(name)}</Name>",
+        f"{indent}  <Action>0</Action>",
+        f"{indent}  <OverwriteDateTime>False</OverwriteDateTime>",
+        f"{indent}  <OverwriteAttributes>False</OverwriteAttributes>",
+        f"{indent}  <HideFromDialogs>0</HideFromDialogs>",
+        f"{indent}  <Files>",
+    ]
+    with os.scandir(folder_path) as entries:
+        for entry in sorted(entries, key=lambda item: item.name.casefold()):
+            if entry.is_dir():
+                lines.extend(_enigma_folder_entry(entry.path, indent + "    "))
+            elif entry.is_file():
+                lines.extend(_enigma_file_entry(entry.path, indent + "    "))
+    lines.extend((f"{indent}  </Files>", f"{indent}</File>"))
+    return lines
+
+
+def generate_enigma_project(template_path, dist_dir, input_exe, output_exe, project_path):
+    """Generate an Enigma project from the files actually produced by Nuitka.
+
+    The checked-in template only supplies registry and runtime options.  Its
+    file list is machine- and Python-version-specific, so it must not be used
+    verbatim for a local build.
+    """
+    with open(template_path, "r", encoding="utf-8", errors="ignore") as handle:
+        template = handle.read()
+    suffix_start = template.index("  <Registries>")
+    suffix = template[suffix_start:]
+    file_tree = _enigma_folder_entry(dist_dir, "      ", is_default_folder=True)
+    lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<>',
+        f"  <InputFile>{xml_escape(os.path.abspath(input_exe))}</InputFile>",
+        f"  <OutputFile>{xml_escape(os.path.abspath(output_exe))}</OutputFile>",
+        "  <Files>",
+        "    <Enabled>True</Enabled>",
+        "    <DeleteExtractedOnExit>False</DeleteExtractedOnExit>",
+        "    <CompressFiles>False</CompressFiles>",
+        "    <Files>",
+        *file_tree,
+        "    </Files>",
+        "  </Files>",
+        suffix.rstrip(),
+        "",
+    ]
+    with open(project_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines))
+    return project_path
+
+
 def step_enigma_package(dist_dir, is_test, enigma_exe):
     """Step 2: Enigma Virtual Box 打包"""
     project_dir = get_project_dir()
@@ -343,21 +431,11 @@ def step_enigma_package(dist_dir, is_test, enigma_exe):
         print(f"[错误] 未找到 EVB 项目文件: {evb_path}")
         sys.exit(1)
 
-    # 测试通道需要替换 EVB 中的路径
-    actual_evb = evb_path
-    if is_test:
-        # 动态生成测试版 EVB：替换 dist 目录路径
-        stable_dist = r'ComfyUI启动器.dist'
-        test_dist = r'ComfyUI启动器_test.dist'
-
-        evb_content = open(evb_path, 'r', encoding='utf-8', errors='ignore').read()
-        test_evb_content = evb_content.replace(stable_dist, test_dist)
-
-        test_evb_path = os.path.join(project_dir, 'EnigmaVirtualBox', 'launcher_test.evb')
-        with open(test_evb_path, 'w', encoding='utf-8', errors='ignore') as f:
-            f.write(test_evb_content)
-        actual_evb = test_evb_path
-        print(f"[封包] 使用测试版 EVB: launcher_test.evb")
+    input_exe = os.path.join(dist_dir, f"{INTERNAL_EXE_NAME}.exe")
+    boxed_exe = os.path.join(dist_dir, BOXED_EXE_NAME)
+    actual_evb = os.path.join(dist_dir, "enigma-build.evb")
+    generate_enigma_project(evb_path, dist_dir, input_exe, boxed_exe, actual_evb)
+    print(f"[封包] 已根据当前构建输出生成 EVB: {actual_evb}")
 
     print(f"\n[2/3] Enigma 打包...")
     print(f"[封包] {enigma_exe}")
@@ -372,7 +450,6 @@ def step_enigma_package(dist_dir, is_test, enigma_exe):
         print(f"[错误] Enigma 打包失败，返回码: {result.returncode}")
         sys.exit(1)
 
-    boxed_exe = os.path.join(dist_dir, BOXED_EXE_NAME)
     if not os.path.exists(boxed_exe):
         print(f"[错误] 打包后未找到输出文件: {boxed_exe}")
         sys.exit(1)
@@ -474,7 +551,7 @@ def main():
 
     # 2. Nuitka 编译
     if not args.evb_only:
-        dist_dir = step_nuitka_compile(args.test)
+        dist_dir = step_nuitka_compile(args.test, args.python_path)
     else:
         dist_dir = get_dist_dir(args.test)
         if not os.path.exists(dist_dir):

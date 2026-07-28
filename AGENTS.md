@@ -118,6 +118,32 @@ python __main__.py <command> [--json] [-v]
 - **agent 不要为单次启动改 `config.json` / 加 `--env` 绕过 GUI**。CLI 就是 GUI 当前配置的 headless 别名——端口、env、paths 全以 GUI 为准。看到端口冲突 / env 不对，应该让用户去 GUI 调整，而不是 agent 自己改配置 / 加 override。
 - **`start` / `stop` 只动 pidfile 里那个 PID**：看不到的另一份 launcher 实例（多环境 GUI 各自）可能随时被它自己的 GUI 关掉。如果看到 8188 突然空了，多半是用户手动操作，**别当成 launcher 的副作用去调查**。
 
+## Windows 正式构建与发布产物
+
+构建正式版 exe 时，**不要使用项目内的 `.venv`**；它可能缺少完整的 Nuitka / PyQt5 构建依赖。使用已验证的工具链：
+
+- 构建 Python：`D:\CodexTools\launcher-build\Scripts\python.exe`
+- Enigma Virtual Box：`D:\CodexTools\EnigmaVirtualBox\enigmavbconsole.exe`
+
+在仓库根目录执行完整的 Nuitka + Enigma 构建：
+
+```powershell
+$env:CL = '/utf-8'
+& 'D:\CodexTools\launcher-build\Scripts\python.exe' build.py `
+  --python-path 'D:\CodexTools\launcher-build\Scripts\python.exe' `
+  --enigma-path 'D:\CodexTools\EnigmaVirtualBox\enigmavbconsole.exe'
+```
+
+- 必须保留 `$env:CL = '/utf-8'`：项目的中文产品元数据会进入 Nuitka 自动生成的 C 头文件；缺少该选项时，MSVC 936 代码页可能报 `C4819` / `C2001: 常量中有换行符`。
+- 构建会重建 `dist/ComfyUI启动器.dist`，并在 `release/` 生成单文件产物 `ComfyUI启动器_v<版本>_<时间戳>.exe`。这是正常且已授权的构建副作用。
+- 构建后至少确认产物存在、大小和 SHA-256，例如：
+
+```powershell
+Get-FileHash -LiteralPath '.\release\<生成的 exe 文件名>' -Algorithm SHA256
+```
+
+- `build_parameters.json` 会更新构建时间；保留用户已有版本号，不要为普通构建擅自传 `--version`。
+
 ## 深入
 
 - 完整 CLI 参考（每命令 flag / Exit codes / Output schema / systemd / NSSM / cron 示例）：[`docs/cli.md`](docs/cli.md)

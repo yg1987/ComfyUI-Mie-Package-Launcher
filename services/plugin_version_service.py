@@ -16,7 +16,7 @@ import re
 import shutil
 import stat
 import subprocess
-from typing import Literal, Optional, Sequence, Tuple
+from typing import Callable, Literal, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
@@ -380,17 +380,33 @@ class PluginVersionService:
     def update_one(self, record: PluginRecord) -> PluginOperationResult:
         return self.update_many([record])[0]
 
-    def update_many(self, records: Sequence[PluginRecord]) -> list[PluginOperationResult]:
+    def update_many(
+        self,
+        records: Sequence[PluginRecord],
+        on_progress: Optional[Callable[[PluginOperationResult, int, int], None]] = None,
+    ) -> list[PluginOperationResult]:
+        """Update records and report each completed plugin result immediately."""
         eligible = [record for record in records if record.can_update and record.target_head]
-        results = [
-            PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message="未通过更新预检")
-            for record in records if record not in eligible
-        ]
+        results: list[PluginOperationResult] = []
+
+        def add_result(result: PluginOperationResult):
+            results.append(result)
+            if on_progress is not None:
+                on_progress(result, len(results), len(records))
+
+        for record in records:
+            if record not in eligible:
+                add_result(PluginOperationResult(
+                    record.name, "update", "skipped", record.state, record.head, record.head,
+                    message="未通过更新预检",
+                ))
         if self._comfyui_is_running():
-            return results + [
-                PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message="ComfyUI 正在运行")
-                for record in eligible
-            ]
+            for record in eligible:
+                add_result(PluginOperationResult(
+                    record.name, "update", "skipped", record.state, record.head, record.head,
+                    message="ComfyUI 正在运行",
+                ))
+            return results
         if not eligible:
             return results
         dependency = self._dependencies()
@@ -409,7 +425,10 @@ class PluginVersionService:
                 plan = preflight.plans[record.path.resolve()]
                 if record not in safe:
                     self._apply_dependency_plan(record, plan)
-                    results.append(PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message=plan.reason))
+                    add_result(PluginOperationResult(
+                        record.name, "update", "skipped", record.state, record.head, record.head,
+                        message=plan.reason,
+                    ))
             # A conflicting candidate must not keep safe candidates blocked by
             # its constraints. Re-resolve exactly the remaining batch.
             dependency.cleanup(preflight)
@@ -426,7 +445,10 @@ class PluginVersionService:
                 if record not in final_safe:
                     plan = preflight.plans[record.path.resolve()]
                     self._apply_dependency_plan(record, plan)
-                    results.append(PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message=plan.reason))
+                    add_result(PluginOperationResult(
+                        record.name, "update", "skipped", record.state, record.head, record.head,
+                        message=plan.reason,
+                    ))
             safe = final_safe
         if not safe:
             dependency.cleanup(preflight)
@@ -434,24 +456,40 @@ class PluginVersionService:
         prepared = dependency.prepare_wheels(preflight)
         if not hasattr(prepared, "forward_lock"):
             dependency.cleanup(preflight)
-            return results + [PluginOperationResult(record.name, "update", "failed", PluginState.UPDATE_FAILED, record.head, record.head, message=prepared.message) for record in safe]
+            for record in safe:
+                add_result(PluginOperationResult(
+                    record.name, "update", "failed", PluginState.UPDATE_FAILED,
+                    record.head, record.head, message=prepared.message,
+                ))
+            return results
         installed = dependency.install_prepared(prepared)
         if not installed.success:
             dependency.cleanup(preflight)
-            return results + [PluginOperationResult(record.name, "update", "failed", PluginState.UPDATE_FAILED, record.head, record.head, message=installed.message) for record in safe]
+            for record in safe:
+                add_result(PluginOperationResult(
+                    record.name, "update", "failed", PluginState.UPDATE_FAILED,
+                    record.head, record.head, message=installed.message,
+                ))
+            return results
         for record in safe:
             old_head = record.head
             merge = self._run_git(record.path, "merge", "--ff-only", record.target_head)
             if merge.returncode != 0:
                 record.state = PluginState.UPDATE_FAILED
                 record.reason = self._git_message(merge)
-                results.append(PluginOperationResult(record.name, "update", "failed", record.state, old_head, old_head, message=record.reason))
+                add_result(PluginOperationResult(
+                    record.name, "update", "failed", record.state, old_head, old_head,
+                    message=record.reason,
+                ))
                 continue
             record.head = record.target_head
             record.state = PluginState.UP_TO_DATE
             record.update_availability = UpdateAvailability.UP_TO_DATE
             record.can_update = False
-            results.append(PluginOperationResult(record.name, "update", "success", record.state, old_head, record.head, installed.additions, installed.changes, "插件与依赖已更新"))
+            add_result(PluginOperationResult(
+                record.name, "update", "success", record.state, old_head, record.head,
+                installed.additions, installed.changes, "插件与依赖已更新",
+            ))
         dependency.cleanup(preflight)
         return results
 

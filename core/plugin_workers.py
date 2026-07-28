@@ -48,9 +48,10 @@ class PluginTaskWorker(QtCore.QThread):
                 self._emit_results(records)
             elif self.task == "update":
                 records: Sequence[PluginRecord] = self.payload or ()
-                results = self.service.update_many(records)
-                for index, result in enumerate(results, start=1):
-                    self.progress.emit(result, index, len(results))
+                results = self.service.update_many(
+                    records,
+                    on_progress=lambda result, current, total: self.progress.emit(result, current, total),
+                )
                 self._emit_results(results)
             elif self.task == "prepare_install":
                 preview = self.service.prepare_install(self.payload)

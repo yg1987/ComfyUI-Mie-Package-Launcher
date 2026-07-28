@@ -7,11 +7,11 @@ on:
       - my-changes
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Build formal Windows test release
+    name: Build formal Windows release
     runs-on: windows-2022
 
     steps:
@@ -65,19 +65,29 @@ jobs:
             throw 'The Enigma project path was not mapped as expected.'
           }
 
-      - name: Build formal test release
+      - name: Build formal release
         shell: pwsh
         run: |
-          python -X utf8 build.py --test
+          python -X utf8 build.py --release
           $release = Get-ChildItem -Path release -Filter '*.exe' -File -Recurse -ErrorAction SilentlyContinue
           if (-not $release) {
             throw 'The formal release executable was not created.'
           }
 
-      - name: Upload formal test release
+      - name: Upload formal release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: comfyui-launcher-test-release-${{ github.sha }}
+          name: comfyui-launcher-release-${{ github.sha }}
           path: release/*.exe
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw build_parameters.json | ConvertFrom-Json).version
+          $tag = "v$version-build.$env:GITHUB_RUN_NUMBER"
+          $release = Get-ChildItem -Path release -Filter '*.exe' -File | Select-Object -First 1
+          gh release create $tag $release.FullName --target $env:GITHUB_SHA --title "ComfyUI启动器 v$version" --generate-notes
