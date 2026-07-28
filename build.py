@@ -31,8 +31,6 @@ ENIGMA_SEARCH_PATHS = [
 
 INTERNAL_EXE_NAME = "ComfyUI_Launcher_Internal"
 BOXED_EXE_NAME = "ComfyUI_Launcher_Internal_boxed.exe"
-# 发布产物里用的人类可读文件名（不再带时间戳，时间戳在父目录上）
-EXE_NAME = "ComfyUI启动器.exe"
 CLI_WRAPPER_NAME = "ComfyUI启动器-CLI.cmd"
 
 # 发布子目录里要带的 launcher 操作文档（让 agent / 用户拿到 release 包就能读到 CLI 介绍）
@@ -422,52 +420,24 @@ def step_copy_release_docs(dest_dir, project_dir):
     return copied
 
 
-def generate_release_dirname(version, is_test):
-    """生成 release 子目录名: ComfyUI启动器_v1.0.10_20260412_1033[_test]。
-
-    内部文件用纯净名 (ComfyUI启动器.exe / ComfyUI启动器-CLI.cmd)，时间戳落在目录上。
-    这样整合包发布后用户拿到 ComfyUI启动器.exe + ComfyUI启动器-CLI.cmd，
-    wrapper 和 exe 永远配对，不会因为改名误用。
-    """
+def generate_release_filename(version, is_test):
+    """生成用户下载的单文件发布名，包含版本和精确到秒的构建时间。"""
     ver = version.lstrip('v') if version else '0.0.0'
-    ts = time.strftime('%Y%m%d_%H%M', time.localtime())
+    ts = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     suffix = "_test" if is_test else ""
-    return f"ComfyUI启动器_v{ver}_{ts}{suffix}"
+    return f"ComfyUI启动器_v{ver}_{ts}{suffix}.exe"
 
 
 def step_finalize_release(boxed_exe, version, is_test):
-    """Step 3: 把 boxed_exe + wrapper 拷到 release/<带时间戳子目录>/
-
-    最终结构：
-        release/ComfyUI启动器_v1.0.10_20260412_1033/
-            ComfyUI启动器.exe         <- 纯净名，不带时间戳
-            ComfyUI启动器-CLI.cmd     <- 配套 wrapper
-    """
+    """Step 3: 生成只含一个自包含 EXE 的发布产物。"""
     project_dir = get_project_dir()
     release_dir = os.path.join(project_dir, 'release')
+    os.makedirs(release_dir, exist_ok=True)
+    exe_dest = os.path.join(release_dir, generate_release_filename(version, is_test))
 
-    dirname = generate_release_dirname(version, is_test)
-    sub_dir = os.path.join(release_dir, dirname)
-
-    # 如果该路径已存在但类型不对（eg. 旧 build 留下的 .exe 单文件），挪开重建
-    if os.path.exists(sub_dir) and not os.path.isdir(sub_dir):
-        print(f"[清理] {sub_dir} 存在但不是目录，移动到 .bak")
-        shutil.move(sub_dir, sub_dir + '.bak')
-    os.makedirs(sub_dir, exist_ok=True)
-
-    print(f"\n[3/3] 生成发布目录 {sub_dir}")
-
-    # 1) ComfyUI启动器.exe （纯净名）
-    exe_dest = os.path.join(sub_dir, EXE_NAME)
+    print(f"\n[3/3] 生成发布文件 {exe_dest}")
     shutil.copy2(boxed_exe, exe_dest)
-
-    # 2) ComfyUI启动器-CLI.cmd （配套 wrapper）
-    step_copy_cli_wrapper(sub_dir, project_dir)
-
-    # 3) 操作文档（让 agent / 用户拿到 release 包就能读到 CLI 介绍）
-    step_copy_release_docs(sub_dir, project_dir)
-
-    return sub_dir
+    return exe_dest
 
 
 def format_duration(seconds):
@@ -547,14 +517,9 @@ def main():
 
     final_path = step_finalize_release(boxed_exe, version, args.test)
 
-    # 构建摘要。final_path 现在是目录，统计整个目录的总大小
+    # 构建摘要。发布物是单一自包含 EXE。
     elapsed = time.time() - start_time
-    total_bytes = sum(
-        os.path.getsize(os.path.join(root, f))
-        for root, _, files in os.walk(final_path)
-        for f in files
-    )
-    size_mb = total_bytes / (1024 * 1024)
+    size_mb = os.path.getsize(final_path) / (1024 * 1024)
 
     print()
     print("=" * 60)
@@ -562,8 +527,8 @@ def main():
     print("=" * 60)
     print(f"  版本:      {version}")
     print(f"  通道:      {channel}")
-    print(f"  输出目录:  {os.path.relpath(final_path, project_dir)}")
-    print(f"  目录大小:  {size_mb:.1f} MB")
+    print(f"  输出文件:  {os.path.relpath(final_path, project_dir)}")
+    print(f"  文件大小:  {size_mb:.1f} MB")
     print(f"  耗时:      {format_duration(elapsed)}")
     print("=" * 60)
 

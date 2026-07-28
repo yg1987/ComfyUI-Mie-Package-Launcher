@@ -4,21 +4,24 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 try:
-    from PyQt5 import QtCore
+    from PyQt5 import QtCore, QtWidgets
     from core.plugin_workers import PluginTaskController, PluginTaskWorker
     from ui_qt.pages.plugin_page import PluginPage
+    from ui_qt.theme_manager import ThemeManager
 except ModuleNotFoundError:  # local non-GUI test interpreter
     QtCore = None
+    QtWidgets = None
     PluginTaskController = None
     PluginTaskWorker = None
     PluginPage = None
+    ThemeManager = None
 
 
 @unittest.skipIf(QtCore is None, "PyQt5 is unavailable in this interpreter")
 class TestPluginWorkers(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.qt_app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
+        cls.qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def test_worker_is_qthread(self):
         worker = PluginTaskWorker(SimpleNamespace(scan_local=lambda: []), "scan")
@@ -75,6 +78,42 @@ class TestPluginWorkers(unittest.TestCase):
         self.assertEqual(page.records, [])
         page._render_records.assert_called_once_with(focus_table=True)
         page.controller.start_scan.assert_not_called()
+
+    def test_refresh_moves_focus_to_table_without_stealing_search_focus(self):
+        """Use a real Qt widget tree to guard the focus behavior users see."""
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(
+            services=SimpleNamespace(plugin_versions=service)
+        )
+        page = PluginPage(app_context, ThemeManager())
+        # A truthy list suppresses the automatic first scan in showEvent; the
+        # test itself is about the focus transition caused by clicking refresh.
+        page.records = [object()]
+        page.resize(900, 600)
+        page.show()
+        self.qt_app.processEvents()
+        try:
+            page.search.setFocus()
+            self.qt_app.processEvents()
+            self.assertIs(self.qt_app.focusWidget(), page.search)
+
+            page.refresh_button.click()
+            deadline = time.monotonic() + 2
+            while page.controller.is_busy() and time.monotonic() < deadline:
+                self.qt_app.processEvents()
+                QtCore.QThread.msleep(5)
+
+            self.qt_app.processEvents()
+            self.assertFalse(page.controller.is_busy())
+            self.assertIs(self.qt_app.focusWidget(), page.table)
+
+            # Filtering should leave a user's active search box alone.
+            page.search.setFocus()
+            page.search.setText("plugin")
+            self.qt_app.processEvents()
+            self.assertIs(self.qt_app.focusWidget(), page.search)
+        finally:
+            page.close()
 
 
 if __name__ == "__main__":

@@ -78,6 +78,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: comfyui-launcher-test-release-${{ github.sha }}
-          path: release/
+          path: release/*.exe
           if-no-files-found: error
           retention-days: 14
