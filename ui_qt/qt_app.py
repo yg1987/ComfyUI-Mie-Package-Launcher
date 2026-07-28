@@ -705,7 +705,7 @@ def _format_update_summary(core_res, req_res):
                     for item in frozen
                 ]
                 if len(names) <= 6:
-                    lines.append(f"  自动跳过（无需操作）：{", ".join(names)}")
+                    lines.append(f"  自动跳过（无需操作）：{', '.join(names)}")
                 else:
                     head = ", ".join(names[:6])
                     lines.append(f"  自动跳过（无需操作）：{head} 等 {len(names)} 项")
@@ -2513,31 +2513,31 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             """)
             return scroll
 
-        content.addWidget(wrap_in_scroll(page_launch))
-        content.addWidget(wrap_in_scroll(page_logs))
-        content.addWidget(wrap_in_scroll(page_plugins))
-        content.addWidget(wrap_in_scroll(page_version))
-        content.addWidget(wrap_in_scroll(page_plugins))
-        content.addWidget(wrap_in_scroll(page_models))
-        content.addWidget(wrap_in_scroll(page_tasks))
-        content.addWidget(wrap_in_scroll(page_settings))
-        content.addWidget(wrap_in_scroll(page_about_me))
-        content.addWidget(wrap_in_scroll(page_about_comfyui))
-        content.addWidget(wrap_in_scroll(page_about_launcher))
-        # Navigation actions
-        pages = {
-            "launch": page_launch,
-            "logs": page_logs,
-            "plugins": page_plugins,
-            "version": page_version,
-            "plugins": page_plugins,
-            "models": page_models,
-            "tasks": page_tasks,
-            "settings": page_settings,
-            "about": page_about_me,
-            "comfyui": page_about_comfyui,
-            "about_launcher": page_about_launcher,
-        }
+        # Keep the sidebar keys, page mapping, and stacked-widget indices in one
+        # ordered source of truth.  Building these separately previously let a
+        # duplicate ``plugins`` entry replace the plugin-version page and shift
+        # every following menu item to the wrong page.
+        page_entries = (
+            ("launch", page_launch),
+            ("logs", page_logs),
+            ("plugins", page_plugins),
+            ("plugin_versions", page_plugin_versions),
+            ("version", page_version),
+            ("models", page_models),
+            ("tasks", page_tasks),
+            ("settings", page_settings),
+            ("about", page_about_me),
+            ("comfyui", page_about_comfyui),
+            ("about_launcher", page_about_launcher),
+        )
+        page_keys = tuple(key for key, _page in page_entries)
+        if tuple(btns) != page_keys:
+            raise RuntimeError(
+                "Navigation button order does not match the registered page order"
+            )
+        pages = dict(page_entries)
+        for _key, page in page_entries:
+            content.addWidget(wrap_in_scroll(page))
 
         def _select_tab(name):
             idx = list(pages.keys()).index(name)
