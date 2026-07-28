@@ -28,10 +28,30 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt nuitka
-          $installer = Join-Path $env:RUNNER_TEMP 'enigmavb.exe'
-          Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' -OutFile $installer
-          Write-Host "Enigma Virtual Box installer SHA-256: $((Get-FileHash -Path $installer -Algorithm SHA256).Hash)"
-          Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -NoNewWindow
+          # The vendor installer occasionally lands on a damaged temporary file in
+          # the hosted runner.  Download each attempt to C: (not RUNNER_TEMP) and
+          # retry with a fresh file before declaring the build failed.
+          $installerDir = Join-Path $env:SystemDrive 'enigma-installers'
+          New-Item -ItemType Directory -Force -Path $installerDir | Out-Null
+          $installed = $false
+          for ($attempt = 1; $attempt -le 3 -and -not $installed; $attempt++) {
+            $installer = Join-Path $installerDir "enigmavb-$env:GITHUB_RUN_ID-$attempt.exe"
+            try {
+              Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' -OutFile $installer
+              if ((Get-Item -LiteralPath $installer).Length -lt 1MB) {
+                throw 'The downloaded Enigma Virtual Box installer is unexpectedly small.'
+              }
+              Write-Host "Enigma installer attempt $attempt SHA-256: $((Get-FileHash -Path $installer -Algorithm SHA256).Hash)"
+              Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -NoNewWindow -ErrorAction Stop
+              $installed = Test-Path 'C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe'
+            }
+            catch {
+              Write-Warning "Enigma installer attempt $attempt failed: $($_.Exception.Message)"
+            }
+          }
+          if (-not $installed) {
+            throw 'Enigma Virtual Box could not be installed after three fresh download attempts.'
+          }
           if (-not (Test-Path 'C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe')) {
             throw 'Enigma Virtual Box console was not installed to the expected location.'
           }
