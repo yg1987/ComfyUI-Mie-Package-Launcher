@@ -37,7 +37,11 @@ jobs:
           for ($attempt = 1; $attempt -le 3 -and -not $installed; $attempt++) {
             $installer = Join-Path $installerDir "enigmavb-$env:GITHUB_RUN_ID-$attempt.exe"
             try {
-              Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' -OutFile $installer
+              curl.exe --fail --location --retry 3 --retry-all-errors --connect-timeout 30 `
+                --output $installer 'https://enigmaprotector.com/assets/files/enigmavb.exe'
+              if ($LASTEXITCODE -ne 0) {
+                throw "Enigma installer download failed with exit code $LASTEXITCODE."
+              }
               if ((Get-Item -LiteralPath $installer).Length -lt 1MB) {
                 throw 'The downloaded Enigma Virtual Box installer is unexpectedly small.'
               }
