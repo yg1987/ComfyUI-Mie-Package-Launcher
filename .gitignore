@@ -67,6 +67,9 @@ status_out.txt
 # Local AI tooling state
 .zcode/
 
+# Local agent improvement notes
+.learnings/
+
 # Stray temp/scratch files
 $
 _test_combo.py

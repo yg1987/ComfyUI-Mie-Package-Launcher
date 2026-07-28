@@ -82,6 +82,8 @@ class PluginRecord:
     update_availability: UpdateAvailability = UpdateAvailability.UNKNOWN
     dependency_state: DependencyState = DependencyState.UNKNOWN
     head: Optional[str] = None
+    local_commit_at: Optional[str] = None
+    remote_commit_at: Optional[str] = None
     branch: Optional[str] = None
     upstream: Optional[str] = None
     remote_name: Optional[str] = None
@@ -349,6 +351,12 @@ class PluginVersionService:
             refreshed.target_head = target.stdout.strip()
         else:
             refreshed.state = PluginState.UP_TO_DATE
+        # ``upstream`` has just been fetched, so its commit date is a useful,
+        # verifiable version indicator for users.  Keep it separate from the
+        # local HEAD date instead of relying on directory modification times.
+        remote_ref = refreshed.target_head or refreshed.upstream
+        if remote_ref:
+            refreshed.remote_commit_at = self._commit_date(refreshed.path, remote_ref)
         refreshed.can_check = True
         refreshed.can_update = False
         return refreshed
@@ -528,6 +536,7 @@ class PluginVersionService:
                 error_code="UNBORN_HEAD",
             )
         head = head_result.stdout.strip()
+        local_commit_at = self._commit_date(path, head)
 
         if self._has_submodules(path):
             return self._record(
@@ -571,6 +580,7 @@ class PluginVersionService:
 
         common = {
             "head": head,
+            "local_commit_at": local_commit_at,
             "branch": branch,
             "upstream": upstream,
             "remote_name": remote_name,
@@ -612,6 +622,14 @@ class PluginVersionService:
                 **common,
             )
         return self._record(path, PluginState.LOCAL_ONLY, can_check=True, **common)
+
+    def _commit_date(self, path: Path, ref: str) -> Optional[str]:
+        """Return a stable, human-readable commit date for a local Git ref."""
+        result = self._run_git(path, "show", "-s", "--format=%cI", ref)
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        return value[:10] if value else None
 
     def _has_submodules(self, path: Path) -> bool:
         gitmodules = self._run_git(path, "cat-file", "-e", "HEAD:.gitmodules")

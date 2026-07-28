@@ -65,6 +65,7 @@ class TestPluginVersionServiceScanLocal(unittest.TestCase):
         self.assertEqual(record.path, repo.resolve())
         self.assertEqual(record.state, PluginState.NO_REMOTE)
         self.assertIsNotNone(record.head)
+        self.assertRegex(record.local_commit_at or "", r"^\d{4}-\d{2}-\d{2}$")
         self.assertFalse(record.can_check)
 
     def test_detects_local_changes_before_remote_state(self):
@@ -175,6 +176,7 @@ class TestPluginVersionServiceScanLocal(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "0\t1\n", ""),
             subprocess.CompletedProcess([], 0, "new-head\n", ""),
+            subprocess.CompletedProcess([], 0, "2026-07-28T10:20:30+08:00\n", ""),
         ]
         with patch.object(self.service, "_scan_candidate", return_value=refreshed), \
              patch.object(self.service, "_run_git", side_effect=responses):
@@ -183,6 +185,7 @@ class TestPluginVersionServiceScanLocal(unittest.TestCase):
         self.assertEqual(result.state, PluginState.UPDATE_AVAILABLE)
         self.assertEqual(result.target_head, "new-head")
         self.assertEqual(result.update_availability, UpdateAvailability.AVAILABLE)
+        self.assertEqual(result.remote_commit_at, "2026-07-28")
 
     def test_update_many_prepares_dependencies_before_fast_forward_merge(self):
         repo = self._create_repo("update-plugin")

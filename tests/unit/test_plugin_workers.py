@@ -1,11 +1,13 @@
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 try:
     from PyQt5 import QtCore, QtWidgets
     from core.plugin_workers import PluginTaskController, PluginTaskWorker
+    from services.plugin_version_service import PluginRecord, PluginState, UpdateAvailability
     from ui_qt.pages.plugin_page import PluginPage
     from ui_qt.theme_manager import ThemeManager
 except ModuleNotFoundError:  # local non-GUI test interpreter
@@ -15,6 +17,9 @@ except ModuleNotFoundError:  # local non-GUI test interpreter
     PluginTaskWorker = None
     PluginPage = None
     ThemeManager = None
+    PluginRecord = None
+    PluginState = None
+    UpdateAvailability = None
 
 
 @unittest.skipIf(QtCore is None, "PyQt5 is unavailable in this interpreter")
@@ -112,6 +117,38 @@ class TestPluginWorkers(unittest.TestCase):
             page.search.setText("plugin")
             self.qt_app.processEvents()
             self.assertIs(self.qt_app.focusWidget(), page.search)
+        finally:
+            page.close()
+
+    def test_plugin_management_table_uses_readable_labels_dates_and_popup_colors(self):
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        page.records = [PluginRecord(
+            "example-plugin", Path("example-plugin"), PluginState.UPDATE_AVAILABLE,
+            update_availability=UpdateAvailability.AVAILABLE,
+            local_commit_at="2026-07-20", remote_commit_at="2026-07-28",
+            head="1234567890abcdef", branch="main",
+            remote_url_display="https://github.com/example/example-plugin.git",
+            can_update=True,
+        )]
+        try:
+            page._render_records()
+
+            self.assertEqual(page.table.columnCount(), 9)
+            self.assertEqual(
+                [page.table.horizontalHeaderItem(i).text() for i in range(9)],
+                ["插件", "是否启用", "状态", "更新状态", "本地日期", "远端日期", "版本", "来源", "操作"],
+            )
+            self.assertEqual(page.table.item(0, 1).text(), "已启用")
+            self.assertEqual(page.table.item(0, 2).text(), "可用")
+            self.assertEqual(page.table.item(0, 3).text(), "可更新")
+            self.assertEqual(page.table.item(0, 4).text(), "2026-07-20")
+            self.assertEqual(page.table.item(0, 5).text(), "2026-07-28")
+            self.assertIn("QAbstractItemView", page.status_filter.styleSheet())
+            self.assertIn("color: #E5E7EB", page.status_filter.styleSheet())
+            self.assertIn("QTableWidget::item", page.table.styleSheet())
+            self.assertIn("color: #E5E7EB", page.table.styleSheet())
         finally:
             page.close()
 
