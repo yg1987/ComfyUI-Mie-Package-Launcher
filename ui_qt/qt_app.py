@@ -2137,7 +2137,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             "launch": NavBtn("🚀 启动与更新"),
             "logs": NavBtn("📋 ComfyUI 实时日志"),
             "plugins": NavBtn("🧩 插件管理"),
-            "plugin_versions": NavBtn("🧩 插件版本管理"),
+            "plugin_versions": NavBtn("🧩 自用-插件管理"),
             "version": NavBtn("🧬 内核版本管理"),
             "models": NavBtn("📂 外置模型库管理"),
             "tasks": NavBtn("📋 后台任务"),
@@ -2166,8 +2166,8 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         btns["about_launcher"].setProperty("full_text", "🧰 关于启动器")
         btns["plugins"].setToolTip("管理 custom_nodes 插件：列已装、勾选更新")
         btns["plugins"].setProperty("full_text", "🧩 插件管理")
-        btns["plugin_versions"].setToolTip("从 GitHub 管理插件版本与依赖，阻止破坏现有环境的更新")
-        btns["plugin_versions"].setProperty("full_text", "🧩 插件版本管理")
+        btns["plugin_versions"].setToolTip("管理自用 GitHub 插件的版本与依赖，并阻止破坏现有环境的更新")
+        btns["plugin_versions"].setProperty("full_text", "🧩 自用-插件管理")
         btns["tasks"].setToolTip("查看后台运行的任务和完成历史")
         btns["tasks"].setProperty("full_text", "📋 后台任务")
         self._nav_buttons = list(btns.values())

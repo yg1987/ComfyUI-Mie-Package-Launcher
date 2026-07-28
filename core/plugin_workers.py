@@ -22,6 +22,11 @@ class PluginTaskWorker(QtCore.QThread):
         self.task = task
         self.payload = payload
         self.cancel_event = threading.Event()
+        self.results = None
+
+    def _emit_results(self, results):
+        self.results = results
+        self.finished_results.emit(results)
 
     def request_cancel(self):
         self.cancel_event.set()
@@ -33,32 +38,31 @@ class PluginTaskWorker(QtCore.QThread):
     def run(self):
         try:
             if self.cancel_event.is_set():
-                self.finished_results.emit([])
+                self._emit_results([])
                 return
             if self.task == "scan":
                 records = self.service.scan_local()
-                self.finished_results.emit(records)
+                self._emit_results(records)
             elif self.task == "refresh":
                 records = self.service.refresh_all()
-                self.finished_results.emit(records)
+                self._emit_results(records)
             elif self.task == "update":
                 records: Sequence[PluginRecord] = self.payload or ()
                 results = self.service.update_many(records)
                 for index, result in enumerate(results, start=1):
                     self.progress.emit(result, index, len(results))
-                self.finished_results.emit(results)
+                self._emit_results(results)
             elif self.task == "prepare_install":
                 preview = self.service.prepare_install(self.payload)
                 self.install_preview_ready.emit(preview)
-                self.finished_results.emit([])
             elif self.task == "install":
                 result = self.service.install_from_preview(self.payload)
                 self.progress.emit(result, 1, 1)
-                self.finished_results.emit([result])
+                self._emit_results([result])
             elif self.task == "uninstall":
                 result = self.service.uninstall_one(self.payload)
                 self.progress.emit(result, 1, 1)
-                self.finished_results.emit([result])
+                self._emit_results([result])
             else:
                 raise ValueError(f"未知插件任务：{self.task}")
         except Exception as exc:
@@ -108,7 +112,9 @@ class PluginTaskController(QtCore.QObject):
         worker = PluginTaskWorker(self.service, task, payload, self)
         self._worker = worker
         worker.progress.connect(self.progress)
-        worker.finished_results.connect(self.finished)
+        # A result handler may immediately start another task.  Delay its
+        # delivery until this QThread has finished and its reference is clear,
+        # otherwise old-task cleanup can delete the new running worker.
         worker.install_preview_ready.connect(self.install_preview_ready)
         worker.failed.connect(self.failed)
         worker.finished.connect(self._clear_worker)
@@ -117,7 +123,10 @@ class PluginTaskController(QtCore.QObject):
 
     def _clear_worker(self):
         worker = self._worker
+        results = worker.results if worker is not None else None
         self._worker = None
         if worker is not None:
             worker.deleteLater()
         self.busy_changed.emit(False)
+        if results is not None:
+            self.finished.emit(results)

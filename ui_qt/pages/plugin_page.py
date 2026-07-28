@@ -95,10 +95,15 @@ class PluginPage(BasePage):
             self.controller.start_install(preview)
 
     def _on_finished(self, results):
-        if results and hasattr(results[0], "state") and not hasattr(results[0], "operation"):
-            self.records = results
+        # An empty scan is a valid completed listing, not a reason to start a
+        # second worker while the previous one is still unwinding.
+        if not results or (
+            hasattr(results[0], "state")
+            and not hasattr(results[0], "operation")
+        ):
+            self.records = list(results)
             self._render_records()
-        elif not self.controller.is_busy():
+        else:
             self.controller.start_scan()
 
     def _on_failed(self, message):
