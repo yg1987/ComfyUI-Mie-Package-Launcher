@@ -52,7 +52,7 @@ jobs:
       - name: Build formal test release
         shell: pwsh
         run: |
-          python build.py --test
+          python -X utf8 build.py --test
           $release = Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue
           if (-not $release) {
             throw 'The formal release executable was not created.'
