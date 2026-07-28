@@ -73,7 +73,7 @@ class TestPluginWorkers(unittest.TestCase):
         PluginPage._on_finished(page, [])
 
         self.assertEqual(page.records, [])
-        page._render_records.assert_called_once_with()
+        page._render_records.assert_called_once_with(focus_table=True)
         page.controller.start_scan.assert_not_called()
 
 

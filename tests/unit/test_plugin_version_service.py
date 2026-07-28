@@ -125,6 +125,22 @@ class TestPluginVersionServiceScanLocal(unittest.TestCase):
             "clone", "--no-recurse-submodules", target.source_url, str(target.staging_path), timeout=120
         )
 
+    def test_git_raw_retries_invalid_windows_handle_with_explicit_streams(self):
+        invalid_handle = OSError(6, "The handle is invalid")
+        fallback = subprocess.CompletedProcess([], 0, "", "")
+
+        with patch("services.plugin_version_service.run_hidden", side_effect=invalid_handle), \
+             patch("services.plugin_version_service.subprocess.run", return_value=fallback) as run:
+            result = self.service._run_git_raw("clone", "https://example.invalid/plugin.git", timeout=12)
+
+        self.assertIs(result, fallback)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["git", "clone", "https://example.invalid/plugin.git"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.PIPE)
+        self.assertIs(kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(kwargs["timeout"], 12)
+
     def test_uninstall_removes_only_a_direct_plugin_directory(self):
         plugin = self.custom_nodes / "remove-me"
         plugin.mkdir()

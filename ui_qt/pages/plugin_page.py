@@ -74,6 +74,7 @@ class PluginPage(BasePage):
         super().showEvent(event)
         if not self.records and not self.controller.is_busy():
             self.controller.start_scan()
+        self.table.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _update_all(self):
         eligible = [record for record in self.records if record.can_update]
@@ -102,7 +103,7 @@ class PluginPage(BasePage):
             and not hasattr(results[0], "operation")
         ):
             self.records = list(results)
-            self._render_records()
+            self._render_records(focus_table=True)
         else:
             self.controller.start_scan()
 
@@ -116,7 +117,7 @@ class PluginPage(BasePage):
         if busy:
             self.progress.setRange(0, 0)
 
-    def _render_records(self):
+    def _render_records(self, focus_table=False):
         query = self.search.text().casefold()
         state = self.status_filter.currentData()
         records = [record for record in self.records if (not state or record.state.value == state) and (not query or query in record.name.casefold() or query in (record.remote_url_display or "").casefold())]
@@ -145,6 +146,8 @@ class PluginPage(BasePage):
         self.page_label.setText(f"第 {self.page + 1} / {pages} 页，共 {len(records)} 个插件")
         self.previous_page.setEnabled(self.page > 0)
         self.next_page.setEnabled(self.page + 1 < pages)
+        if focus_table:
+            self.table.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _confirm_uninstall(self, record):
         if QtWidgets.QMessageBox.question(self, "确认卸载", f"永久删除插件目录：{record.path}\nPython 依赖不会删除。是否继续？") == QtWidgets.QMessageBox.Yes:

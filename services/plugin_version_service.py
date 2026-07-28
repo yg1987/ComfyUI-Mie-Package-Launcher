@@ -669,10 +669,31 @@ class PluginVersionService:
 
     def _run_git_raw(self, *args: str, timeout: int) -> subprocess.CompletedProcess:
         git_path = getattr(self.app, "git_path", None) or "git"
-        return run_hidden(
-            [str(git_path), *args], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
-        )
+        command = [str(git_path), *args]
+        try:
+            return run_hidden(
+                command, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+        except OSError as exc:
+            # Some Windows GUI sessions expose an invalid inherited standard
+            # handle even though the common hidden-process helper normally
+            # guards stdin.  Retry Git with every standard handle explicitly
+            # redirected so installing a plugin remains usable.
+            if getattr(exc, "winerror", None) != 6 and exc.errno != 6:
+                raise
+            kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": timeout,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            return subprocess.run(command, **kwargs)
 
     def _dependencies(self):
         if self._dependency_service is None:
