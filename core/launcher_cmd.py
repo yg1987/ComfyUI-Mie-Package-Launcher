@@ -3,16 +3,28 @@ import shlex
 from pathlib import Path
 from utils import paths as PATHS
 
-def build_launch_params(app):
-    paths = app.config.get("paths", {})
+def build_launch_params(app, env_id=None):
+    # 多环境支持：优先用 app.get_active_paths() 解析当前激活环境的路径。
+    # 若传了 env_id（CLI --env），则用指定环境覆盖（本次启动用，不改 config）。
+    # 兼容老 app 对象和 mock（没有该方法 / 返回非 dict 时退回 config["paths"]）。
+    paths = None
+    try:
+        if env_id and isinstance(getattr(app, "config", None), dict):
+            from config.migrations import resolve_paths_for_env
+            paths = resolve_paths_for_env(app.config, env_id)
+        if not isinstance(paths, dict) and hasattr(app, "get_active_paths"):
+            got = app.get_active_paths()
+            if isinstance(got, dict):
+                paths = got
+    except Exception:
+        paths = None
+    if not isinstance(paths, dict):
+        paths = app.config.get("paths", {}) if isinstance(getattr(app, "config", None), dict) else {}
     base = Path(paths.get("comfyui_root") or ".").resolve()
     comfy_root = (base / "ComfyUI").resolve()
-    py = PATHS.resolve_python_exec(comfy_root, app.config["paths"].get("python_path", "python_embeded/python.exe"))
-    try:
-        app.config["paths"]["python_path"] = str(py)
-        app.save_config()
-    except Exception:
-        pass
+    py = PATHS.resolve_python_exec(comfy_root, paths.get("python_path", "python_embeded/python.exe"))
+    # 注意：多环境下不能把解析后的绝对路径回写到全局 config（会污染其他环境），
+    # 解析结果 py 只在本次启动的内存中使用。
     main = comfy_root / "main.py"
     py_dir = str(Path(py).resolve().parent)
     cmd = [
@@ -96,6 +108,10 @@ def build_launch_params(app):
     except Exception:
         pass
     env = os.environ.copy()
+    # ComfyUI 在隐藏控制台模式下将 stdout/stderr 重定向到普通文件。
+    # Python 对文件默认使用块缓冲，会让 tqdm 的回车刷新直到任务完成才落盘。
+    # 强制无缓冲后，每次进度刷新都能被 LogTailer 在轮询周期内读到。
+    env["PYTHONUNBUFFERED"] = "1"
     try:
         sel = app.selected_hf_mirror.get()
         if sel != "不使用镜像":
@@ -168,6 +184,17 @@ def build_launch_params(app):
                 pass
     except Exception:
         pass
+    # 用户自定义环境变量（启动页「启动环境变量」input 配置）
+    # 顺序: 系统 < 启动器默认(HF/GITHUB/PATH/GIT) < 用户
+    # 故意放最后: 用户可以覆盖 HF_ENDPOINT 等启动器默认设置
+    try:
+        for k, v in app.get_user_env_vars():
+            env[str(k)] = str(v)
+    except Exception as e:
+        try:
+            app.logger.warning("应用用户环境变量失败: %s", e)
+        except Exception:
+            pass
     try:
         run_cwd = str(comfy_root)
     except Exception:

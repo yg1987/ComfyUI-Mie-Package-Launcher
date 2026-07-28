@@ -4,11 +4,39 @@ Provides the same attribute interface as the PyQt app object.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 from config.manager import atomic_write_json
+from config.migrations import migrate_environments, resolve_active_paths
+
+
+_ENV_VAR_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _parse_user_env_string(raw: str) -> List[Tuple[str, str]]:
+    """Parse a 'K=V, K2=V2' style string into validated (key, value) tuples.
+
+    Whitespace around each segment is tolerated. Segments without '=' or
+    with an invalid key (must match ``[A-Za-z_][A-Za-z0-9_]*``) are
+    silently dropped. Values may contain '=' and other characters; only
+    the first '=' splits key from value.
+    """
+    out: List[Tuple[str, str]] = []
+    if not raw:
+        return out
+    for segment in raw.split(","):
+        part = segment.strip()
+        if not part or "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        key = key.strip()
+        if not _ENV_VAR_KEY_RE.match(key):
+            continue
+        out.append((key, value.strip()))
+    return out
 
 
 class StringVar:
@@ -78,9 +106,22 @@ class _VersionManagerProxy:
         return {"component": "core", "updated": False}
 
 
-class _HeadlessProcessManager:
+class _NoOpBigBtn:
+    """core.runner_start.start() 会调用 app.big_btn.set_state / set_display。
+
+    CLI 模式没有 UI 按钮，给一个 no-op 替身即可。
+    """
     def __init__(self):
-        self.comfyui_process = None
+        self._state = "idle"
+
+    def set_state(self, state: str) -> None:
+        self._state = state
+
+    def set_display(self, text: str, hint: str = "") -> None:
+        pass
+
+
+class _HeadlessProcessManager:
 
     def toggle_comfyui(self):
         return None
@@ -126,6 +167,15 @@ class HeadlessAppContext:
         with open(config_file, "r", encoding="utf-8") as f:
             self.config = json.load(f)
 
+        # CLI 不走 ConfigManager 的迁移路径，这里直接补一次多环境迁移，
+        # 把老 paths 段升级成 environments + active_env_id。失败不致命：
+        # resolve_active_paths 还能回退到老 paths 段。
+        try:
+            if migrate_environments(self.config):
+                self.save_config()
+        except Exception:
+            pass
+
         # Load launch_options with defaults
         launch_opts = self.config.get("launch_options", {})
 
@@ -141,6 +191,7 @@ class HeadlessAppContext:
         self.disable_api_nodes = BoolVar(launch_opts.get("disable_api_nodes", False))
         self.use_new_manager = BoolVar(False)
         self.extra_launch_args = StringVar(launch_opts.get("extra_args", ""))
+        self.user_env_vars = StringVar(launch_opts.get("env_vars", ""))
         self.attention_mode = StringVar(launch_opts.get("attention_mode", ""))
         self.browser_open_mode = StringVar(
             launch_opts.get("browser_open_mode", "default")
@@ -160,7 +211,25 @@ class HeadlessAppContext:
         # Version manager proxy
         self.version_manager = _VersionManagerProxy(proxy_settings)
 
-        paths_cfg = self.config.get("paths", {})
+        # 更新选项（对应 GUI "批量更新" 对话框的复选框）
+        # CLI `update comfyui` 默认全选；config["version_preferences"] 可覆盖，
+        # 缺省按 GUI 默认 True。修 CLI 报 "no attribute update_core_var" 时加。
+        vp = self.config.get("version_preferences", {}) if isinstance(self.config, dict) else {}
+        self.update_core_var = BoolVar(True)
+        self.update_frontend_var = BoolVar(True)
+        self.update_template_var = BoolVar(True)
+        self.stable_only_var = BoolVar(bool(vp.get("stable_only", True)))
+        self.auto_update_deps_var = BoolVar(bool(vp.get("auto_update_deps", True)))
+
+        # PyPI 镜像设置（services.update_service._resolve_index_url 会读）
+        # 缺省 aliyun（与 Qt 默认对齐），用户 config 里可覆盖。
+        self.pypi_proxy_mode = StringVar(proxy_settings.get("pypi_proxy_mode", "aliyun"))
+        self.pypi_proxy_url = StringVar(
+            proxy_settings.get("pypi_proxy_url", "https://mirrors.aliyun.com/pypi/simple/")
+        )
+
+        # 多环境支持：读激活环境的 python_path（与 PyQtLauncher 启动逻辑对齐）
+        paths_cfg = self.get_active_paths()
         self.python_exec = str(paths_cfg.get("python_path") or sys.executable)
         self.git_path = "git"
 
@@ -168,6 +237,7 @@ class HeadlessAppContext:
         self.logger = _NoOpLogger()
 
         self.process_manager = _HeadlessProcessManager()
+        self.big_btn = _NoOpBigBtn()
 
         # Launching state flag
         self._launching = False
@@ -175,8 +245,35 @@ class HeadlessAppContext:
         # Root object with .after() method
         self.root = _NoOpRoot()
 
-        # Services object (mock)
-        self._services = _NoOpServices()
+        # Services object（_NoOpServices 会挂一个真实 VersionService，详见类注释）
+        self._services = _NoOpServices(self)
+
+    def get_user_env_vars(self):
+        """Return validated [(key, value), ...] from ``self.user_env_vars``.
+
+        The raw text lives in ``self.user_env_vars`` (StringVar). This
+        method parses it through ``_parse_user_env_string`` so tests and
+        runtime callers don't have to know the syntax. Returns an empty
+        list when the attribute is missing (e.g. older HeadlessAppContext).
+        """
+        raw = getattr(self, 'user_env_vars', None)
+        if raw is None:
+            return []
+        try:
+            text = raw.get() or ''
+        except Exception:
+            return []
+        return _parse_user_env_string(text)
+
+    def get_active_paths(self):
+        """Return the active environment's paths sub-dict.
+
+        多环境支持：解析 ``config["environments"]`` 里激活的那个环境，
+        返回形如 ``{"comfyui_root": ..., "python_path": ...}`` 的子 dict。
+        调用方（build_launch_params 等）应优先用这个，而不是直接读
+        ``config["paths"]``。未迁移时回退到老 paths 段。
+        """
+        return resolve_active_paths(self.config)
 
     @property
     def services(self):
@@ -198,9 +295,18 @@ class HeadlessAppContext:
 
 
 class _NoOpServices:
-    """No-op services object with .runtime attribute."""
+    """Headless services object — .version 是真实 VersionService。
 
-    def __init__(self):
+    services.update_service.UpdateService.perform_batch_update() 会调
+    ``self.app.services.version.upgrade_latest(...)`` 和 ``.get_current_kernel_version()``，
+    CLI ``update comfyui`` 必须能跑真实更新（不只是 no-op），所以这里挂一个真实的
+    VersionService（它只依赖 app.config / app.logger / app.git_path，headless 都有）。
+    其它服务（process / config / runtime / ...）CLI 当前不接触，保持 no-op。
+    """
+
+    def __init__(self, app):
+        from services.version_service import VersionService
+        self.version = VersionService(app)
         self.runtime = _NoOpRuntime()
 
 

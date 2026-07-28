@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           python -X utf8 build.py --test
-          $release = Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue
+          $release = Get-ChildItem -Path release -Filter '*.exe' -File -Recurse -ErrorAction SilentlyContinue
           if (-not $release) {
             throw 'The formal release executable was not created.'
           }
@@ -62,6 +62,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: comfyui-launcher-test-release-${{ github.sha }}
-          path: release/*.exe
+          path: release/
           if-no-files-found: error
           retention-days: 14

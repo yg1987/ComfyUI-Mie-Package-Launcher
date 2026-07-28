@@ -7,7 +7,7 @@ from typing import Sequence
 
 from PyQt5 import QtCore
 
-from services.plugin_service import PluginOperationResult, PluginRecord
+from services.plugin_version_service import PluginOperationResult, PluginRecord
 
 
 class PluginTaskWorker(QtCore.QThread):

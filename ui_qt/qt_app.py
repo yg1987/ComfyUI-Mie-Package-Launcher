@@ -8,6 +8,7 @@ from PyQt5.QtCore import Qt
 from utils import paths as PATHS
 from utils.logging import install_logging
 from config.manager import ConfigManager
+from config.migrations import resolve_active_paths
 from services.di import ServiceContainer
 from core.version_service import refresh_version_info
 from core.process_manager import ProcessManager
@@ -39,6 +40,10 @@ from ui_qt.pages.models_page import ModelsPage
 from ui_qt.pages.about_me_page import AboutMePage
 from ui_qt.pages.about_comfyui_page import AboutComfyUIPage
 from ui_qt.pages.about_launcher_page import AboutLauncherPage
+from ui_qt.pages.plugins_page import PluginsPage, PluginController
+from ui_qt.pages.system_settings_page import SystemSettingsPage
+from ui_qt.widgets.tray_icon import LauncherTray
+from ui_qt.log_viewer import LogViewerPage
 
 
 class Var:
@@ -79,6 +84,8 @@ class BigBtnProxy:
         self._action_label = None
         self._state = "idle"
         self._text = None
+        self._display_status = None
+        self._display_action = None
 
     def attach(self, qbtn, status_label=None, action_label=None):
         self._btn = qbtn
@@ -96,16 +103,28 @@ class BigBtnProxy:
 
     def set_display(self, status, action=""):
         """设置双行显示：状态行（大字）+ 操作行（小字）"""
+        if (
+            self._display_status == status
+            and self._display_action == action
+        ):
+            return
+        self._display_status = status
+        self._display_action = action
         self._text = f"{status}\n{action}" if action else status
         if self._status_label is not None:
-            self._status_label.setText(status)
+            if self._status_label.text() != status:
+                self._status_label.setText(status)
             self._status_label.setVisible(True)
         if self._action_label is not None:
-            self._action_label.setText(action)
-            self._action_label.setVisible(bool(action))
+            if self._action_label.text() != action:
+                self._action_label.setText(action)
+            want_visible = bool(action)
+            if self._action_label.isVisible() != want_visible:
+                self._action_label.setVisible(want_visible)
         if self._status_label is None and self._btn is not None:
             try:
-                self._btn.setText(self._text)
+                if self._btn.text() != self._text:
+                    self._btn.setText(self._text)
             except Exception:
                 pass
 
@@ -113,20 +132,29 @@ class BigBtnProxy:
         if self._status_label is not None:
             if '\n' in t:
                 parts = t.split('\n', 1)
-                self._status_label.setText(parts[0])
+                if self._status_label.text() != parts[0]:
+                    self._status_label.setText(parts[0])
                 self._status_label.setVisible(True)
                 if self._action_label is not None:
-                    self._action_label.setText(parts[1])
-                    self._action_label.setVisible(bool(parts[1]))
+                    sub = parts[1]
+                    if self._action_label.text() != sub:
+                        self._action_label.setText(sub)
+                    want_visible = bool(sub)
+                    if self._action_label.isVisible() != want_visible:
+                        self._action_label.setVisible(want_visible)
             else:
-                self._status_label.setText(t)
+                if self._status_label.text() != t:
+                    self._status_label.setText(t)
                 self._status_label.setVisible(True)
                 if self._action_label is not None:
-                    self._action_label.setText("")
-                    self._action_label.setVisible(False)
+                    if self._action_label.text():
+                        self._action_label.setText("")
+                    if self._action_label.isVisible():
+                        self._action_label.setVisible(False)
         elif self._btn is not None:
             try:
-                self._btn.setText(t)
+                if self._btn.text() != t:
+                    self._btn.setText(t)
             except Exception:
                 pass
 
@@ -187,10 +215,12 @@ class VersionWorker(QtCore.QThread):
 
     def run(self):
         try:
+            # 多环境支持：读激活环境的路径
             paths = (
-                self.app.config.get("paths", {})
-                if isinstance(self.app.config, dict)
-                else {}
+                self.app.get_active_paths()
+                if hasattr(self.app, "get_active_paths")
+                else (self.app.config.get("paths", {})
+                      if isinstance(self.app.config, dict) else {})
             )
             base = Path(paths.get("comfyui_root") or ".").resolve()
             root = (base / "ComfyUI").resolve()
@@ -838,6 +868,14 @@ def _offer_force_update(launcher, core_res, summary, stable_only, on_done) -> bo
 class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
     def __init__(self):
         # 高分屏适配已在 comfyui_launcher_pyqt.py 中完成（必须在 QApplication 创建之前）
+        # 系统托盘与关闭行为相关状态
+        self._tray = None  # LauncherTray 实例，在 run() 中完成初始化
+        self._tray_quit_requested = False  # 从托盘菜单退出时为 True，跳过确认对话框
+        self._tray_quit_and_stop_requested = False  # 从托盘菜单选择"退出并关闭 ComfyUI"
+        self._tray_warned_unavailable = False  # 避免重复警告托盘不可用
+        # Win32 标题栏拖动 / 缩放期间推迟 UI 刷新，避免与 DWM 模态循环抢主线程
+        self._in_size_move = False
+        self._pending_running_ui = None
         self.qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
             sys.argv
         )
@@ -871,19 +909,22 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         cfg_file = (Path.cwd() / "launcher" / "config.json").resolve()
         self.config_manager = ConfigManager(cfg_file, self.logger)
         self.config = self.config_manager.load_config()
+        # 多环境支持：用激活环境的路径解析 python_exec（get_active_paths 会
+        # 优先读 environments[active_env_id]，未迁移时回退老 config["paths"]）。
+        active_paths = self.get_active_paths()
         comfy_base = Path(
-            self.config.get("paths", {}).get("comfyui_root") or "."
+            active_paths.get("comfyui_root") or "."
         ).resolve()
         comfy_path = (comfy_base / "ComfyUI").resolve()
         py_exec = PATHS.resolve_python_exec(
             comfy_path,
-            self.config.get("paths", {}).get(
+            active_paths.get(
                 "python_path", "python_embeded/python.exe"
             ),
         )
         self.python_exec = str(py_exec)
-        self.config.setdefault("paths", {})
-        self.config["paths"]["python_path"] = self.python_exec
+        # 注意：多环境下不回写 config["paths"]["python_path"]（会污染其他环境）。
+        # 解析结果只存在 self.python_exec 内存里，build_launch_params 每次现解析。
         self.root = QtRootAdapter()
         # 历史上曾有 "directml" 选项，这里统一回退为 "gpu"
         self.compute_mode = Var("gpu")
@@ -949,8 +990,9 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             self.custom_browser_path.set(
                 launch_cfg.get("custom_browser_path", self.custom_browser_path.get())
             )
+            _sc_val = launch_cfg.get("show_console", True)
             self.show_console.set(
-                launch_cfg.get("show_console", True)
+                _sc_val
             )
             try:
                 self.gpu_device.set(int(launch_cfg.get("gpu_device", -1)))
@@ -1057,8 +1099,11 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
             def get_remote_url(self):
                 try:
+                    # 多环境支持：读激活环境的 comfyui_root
+                    _ap = self.app.get_active_paths() if hasattr(self.app, "get_active_paths") \
+                        else self.app.config.get("paths", {})
                     base = Path(
-                        self.app.config.get("paths", {}).get("comfyui_root") or "."
+                        _ap.get("comfyui_root") or "."
                     ).resolve()
                     root = (base / "ComfyUI").resolve()
                 except Exception:
@@ -1110,6 +1155,11 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         self.process_manager = ProcessManager(self)
         process_events.register_callback(self)
         self.services = ServiceContainer.from_app(self)
+        # Adopt any legacy extra_model_paths.yaml produced by older launcher builds.
+        try:
+            self.services.model_path.migrate_legacy_yaml()
+        except Exception:
+            pass
         self._setup_ui()
 
     def ui_post(self, fn):
@@ -1450,6 +1500,8 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
             # Update nav button style
             if hasattr(self, "_nav_buttons"):
+                # 选中态：半透明紫底 + 紫字 + 左侧 4px 紫色指示条（替代原白底黑字，呼应品牌紫）。
+                # border-left 在 1px border 之后再设，覆盖左边为 4px 粗指示条。
                 nav_style = """QPushButton {{
                         color: {text_muted};
                         background-color: transparent;
@@ -1468,6 +1520,8 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                         background-color: {checked_bg};
                         color: {checked_text};
                         border: 1px solid {checked_border};
+                        border-left: 4px solid {checked_accent};
+                        padding-left: 12px;
                         font-weight: bold;
                     }}"""
                 if c is not None:
@@ -1476,18 +1530,20 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                             text_muted=c.get("sidebar_text_muted"),
                             hover_bg=c.get("btn_ghost_bg"),
                             hover_text=c.get("text"),
-                            checked_bg=c.get("text"),
-                            checked_text="#333333",
-                            checked_border=c.get("label_muted"),
+                            checked_bg="rgba(127, 86, 217, 0.15)",
+                            checked_text=c.get("btn_primary_hover"),
+                            checked_border="rgba(127, 86, 217, 0.3)",
+                            checked_accent=c.get("btn_primary_bg"),
                         )
                     else:
                         qss = nav_style.format(
                             text_muted=c.get("sidebar_text"),
-                            hover_bg="rgba(56, 189, 248, 0.12)",
+                            hover_bg="rgba(127, 86, 217, 0.10)",
                             hover_text=c.get("text"),
-                            checked_bg="#38BDF8",
-                            checked_text=c.get("text"),
-                            checked_border="#0EA5E9",
+                            checked_bg="rgba(127, 86, 217, 0.12)",
+                            checked_text=c.get("btn_primary_pressed"),
+                            checked_border="rgba(127, 86, 217, 0.3)",
+                            checked_accent=c.get("btn_primary_bg"),
                         )
                 else:
                     if dark:
@@ -1495,18 +1551,20 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                             text_muted="#999999",
                             hover_bg="rgba(255, 255, 255, 0.1)",
                             hover_text="#FFFFFF",
-                            checked_bg="#FFFFFF",
-                            checked_text="#333333",
-                            checked_border="#E5E7EB",
+                            checked_bg="rgba(127, 86, 217, 0.15)",
+                            checked_text="#9E77ED",
+                            checked_border="rgba(127, 86, 217, 0.3)",
+                            checked_accent="#7F56D9",
                         )
                     else:
                         qss = nav_style.format(
                             text_muted="#1F2937",
-                            hover_bg="rgba(56, 189, 248, 0.12)",
+                            hover_bg="rgba(127, 86, 217, 0.10)",
                             hover_text="#0F172A",
-                            checked_bg="#38BDF8",
-                            checked_text="#0F172A",
-                            checked_border="#0EA5E9",
+                            checked_bg="rgba(127, 86, 217, 0.12)",
+                            checked_text="#53389E",
+                            checked_border="rgba(127, 86, 217, 0.3)",
+                            checked_accent="#7F56D9",
                         )
                 for b in self._nav_buttons:
                     b.setStyleSheet(qss)
@@ -1935,9 +1993,14 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         try:
             from PyQt5.QtGui import QIcon
 
-            icon_path = ASSETS.resolve_asset("rabbit.ico") or ASSETS.resolve_asset(
-                "rabbit.png"
-            )
+            # 优先用高分辨率 rabbit.png（任务栏/Alt-Tab 在 HiDPI 下更清晰），
+            # 退回 rabbit.ico；逐个检查存在性，避免 resolve_asset 返回不存在路径被误用
+            icon_path = None
+            for _icon_name in ("rabbit.png", "rabbit.ico"):
+                _candidate = ASSETS.resolve_asset(_icon_name)
+                if _candidate and _candidate.exists():
+                    icon_path = _candidate
+                    break
             if icon_path and icon_path.exists():
                 ic = QIcon(str(icon_path))
                 # 同时设置窗口与应用图标，以确保任务栏/Alt-Tab 使用头像
@@ -2072,27 +2135,43 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
         btns = {
             "launch": NavBtn("🚀 启动与更新"),
-            "version": NavBtn("🧬 内核版本管理"),
+            "logs": NavBtn("📋 ComfyUI 实时日志"),
             "plugins": NavBtn("🧩 插件管理"),
+            "plugin_versions": NavBtn("🧩 插件版本管理"),
+            "version": NavBtn("🧬 内核版本管理"),
             "models": NavBtn("📂 外置模型库管理"),
+            "tasks": NavBtn("📋 后台任务"),
+            "settings": NavBtn("⚙️ 系统设置"),
             "about": NavBtn("👤 关于我"),
             "comfyui": NavBtn("📚 关于 ComfyUI"),
             "about_launcher": NavBtn("🧰 关于启动器"),
         }
+        # btns dict 的插入顺序 = nav 显示顺序。tasks 在 settings 前。
         # 为导航按钮添加工具提示和存储完整文字
         btns["launch"].setToolTip("启动、停止ComfyUI，查看运行状态")
         btns["launch"].setProperty("full_text", "🚀 启动与更新")
+        btns["logs"].setToolTip("实时显示 ComfyUI 运行日志")
+        btns["logs"].setProperty("full_text", "📋 ComfyUI 实时日志")
         btns["version"].setToolTip("管理ComfyUI内核版本，切换提交")
         btns["version"].setProperty("full_text", "🧬 内核版本管理")
         btns["models"].setToolTip("管理外置模型库路径配置")
         btns["models"].setProperty("full_text", "📂 外置模型库管理")
+        btns["settings"].setToolTip("启动器本体的窗口、托盘等设置")
+        btns["settings"].setProperty("full_text", "⚙️ 系统设置")
         btns["about"].setToolTip("作者信息和相关链接")
         btns["about"].setProperty("full_text", "👤 关于我")
         btns["comfyui"].setToolTip("关于ComfyUI的介绍和官方链接")
         btns["comfyui"].setProperty("full_text", "📚 关于 ComfyUI")
         btns["about_launcher"].setToolTip("关于启动器的介绍和相关链接")
         btns["about_launcher"].setProperty("full_text", "🧰 关于启动器")
+        btns["plugins"].setToolTip("管理 custom_nodes 插件：列已装、勾选更新")
+        btns["plugins"].setProperty("full_text", "🧩 插件管理")
+        btns["plugin_versions"].setToolTip("从 GitHub 管理插件版本与依赖，阻止破坏现有环境的更新")
+        btns["plugin_versions"].setProperty("full_text", "🧩 插件版本管理")
+        btns["tasks"].setToolTip("查看后台运行的任务和完成历史")
+        btns["tasks"].setProperty("full_text", "📋 后台任务")
         self._nav_buttons = list(btns.values())
+        self._nav_btn_map = btns  # key→按钮映射，供 _refresh_bg_tasks_nav 等按 key 取按钮
         for b in btns.values():
             nav.addWidget(b)
 
@@ -2178,6 +2257,15 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         theme_row_layout.addWidget(btn_light, 1)
 
         bottom_layout.addWidget(theme_row)
+
+        # 后台任务注册表（「后台任务」现在是左侧导航的一个标签页，见 page_tasks）。
+        # 信号连 _refresh_bg_tasks_nav，用 nav 按钮的文字反映任务计数（badge 效果）。
+        from ui_qt.background_task_registry import BackgroundTaskRegistry
+        self._bg_task_registry = BackgroundTaskRegistry(self)
+        self._bg_tasks_page = None  # page 创建后赋值
+        self._bg_task_registry.task_added.connect(lambda _tid: self._refresh_bg_tasks_nav())
+        self._bg_task_registry.task_updated.connect(lambda _tid: self._refresh_bg_tasks_nav())
+        self._bg_task_registry.task_removed.connect(lambda _tid: self._refresh_bg_tasks_nav())
 
         side_layout.addWidget(bottom_container)
         nav.addStretch(1)
@@ -2277,7 +2365,15 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
         # Create page instances using new refactored pages
         page_launch = LaunchPage(app=self, theme_manager=self.theme_manager)
-        self._launch_page = page_launch  # 保存引用，用于后续更新显示
+        self._launch_page = page_launch
+        # 日志页:实时 tail ComfyUI 日志
+        page_logs = LogViewerPage(theme_manager=self.theme_manager)
+        self._log_viewer_page = page_logs  # 保存引用，用于后续更新显示
+        # 新日志 → nav 按钮加 "*" 前缀提示;切到日志页自动清零
+        try:
+            page_logs.new_logs_received.connect(self._refresh_logs_nav)
+        except Exception:
+            pass
         try:
             if hasattr(self, "big_btn"):
                 self.big_btn.attach(
@@ -2288,44 +2384,70 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         except Exception:
             pass
 
-        # 定时检测 ComfyUI 运行状态并同步按钮（每 5 秒）
+        # 定时检测 ComfyUI 运行状态并同步按钮（每 5 秒）。
+        # 托盘状态由 refresh_status 异步回调 _apply_comfyui_running_ui 更新；
+        # 切勿在此处同步 HTTP 探测——会在 UI 线程阻塞 ~1s，拖动标题栏时体感卡顿。
         try:
+            def _refresh_and_push_to_tray():
+                try:
+                    if hasattr(self, "services") and hasattr(self.services, "process"):
+                        self.services.process.refresh_status()
+                except Exception:
+                    pass
+
             self._status_timer = QtCore.QTimer(self)
-            self._status_timer.timeout.connect(
-                lambda: (
-                    self.services.process.refresh_status()
-                    if hasattr(self, "services") and hasattr(self.services, "process")
-                    else None
-                )
-            )
+            self._status_timer.timeout.connect(_refresh_and_push_to_tray)
             self._status_timer.start(5000)
             # 首次立即检测一次
-            QtCore.QTimer.singleShot(500, lambda: (
-                self.services.process.refresh_status()
-                if hasattr(self, "services") and hasattr(self.services, "process")
-                else None
-            ))
+            QtCore.QTimer.singleShot(500, _refresh_and_push_to_tray)
         except Exception:
             pass
         page_version = VersionPage(app=self, theme_manager=self.theme_manager)
-        page_plugins = PluginPage(app=self, theme_manager=self.theme_manager)
+        page_plugin_versions = PluginPage(app=self, theme_manager=self.theme_manager)
         page_models = ModelsPage(app=self, theme_manager=self.theme_manager)
         page_about_me = AboutMePage(theme_manager=self.theme_manager)
         page_about_comfyui = AboutComfyUIPage(theme_manager=self.theme_manager)
         page_about_launcher = AboutLauncherPage(
             app=self, theme_manager=self.theme_manager
         )
+        page_plugins = PluginsPage(app=self, theme_manager=self.theme_manager)
+        self._plugins_page = page_plugins  # 供 _do_plugin_check_updates 等回推结果用
+        # 后台任务页：注册表已在 _setup_ui 侧边栏构造时建好（self._bg_task_registry）
+        from ui_qt.widgets.background_task_panel import BackgroundTasksPage
+        page_tasks = BackgroundTasksPage(
+            self._bg_task_registry, theme_manager=self.theme_manager, parent=self)
+        self._bg_tasks_page = page_tasks  # 供 badge 刷新等用
+        page_settings = SystemSettingsPage(
+            app=self, theme_manager=self.theme_manager
+        )
 
         # Store references for theme updates
         self._new_pages = {
             "launch": page_launch,
+            "logs": page_logs,
             "version": page_version,
             "plugins": page_plugins,
+            "plugin_versions": page_plugin_versions,
             "models": page_models,
+            "settings": page_settings,
             "about": page_about_me,
             "comfyui": page_about_comfyui,
             "about_launcher": page_about_launcher,
+            "tasks": page_tasks,
         }
+
+        # 多环境：设置页改了环境列表 → 同步刷新启动页的环境下拉框 + 路径摘要。
+        # 两个组件在不同页面，通过信号跨页通信。
+        try:
+            env_mgr = getattr(page_settings, "env_manager_section", None)
+            env_selector = getattr(page_launch, "environment_selector", None)
+            if env_mgr is not None and env_selector is not None:
+                # 列表增删改 → 刷新下拉框选项
+                env_mgr.environments_changed.connect(env_selector.reload)
+                # 激活环境切换 → 集中刷新所有依赖环境路径的页面
+                env_mgr.active_env_changed.connect(self.refresh_after_env_switch)
+        except Exception:
+            pass
 
         def wrap_in_scroll(widget):
             # Ensure the widget inside scroll area is transparent
@@ -2392,18 +2514,26 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             return scroll
 
         content.addWidget(wrap_in_scroll(page_launch))
+        content.addWidget(wrap_in_scroll(page_logs))
+        content.addWidget(wrap_in_scroll(page_plugins))
         content.addWidget(wrap_in_scroll(page_version))
         content.addWidget(wrap_in_scroll(page_plugins))
         content.addWidget(wrap_in_scroll(page_models))
+        content.addWidget(wrap_in_scroll(page_tasks))
+        content.addWidget(wrap_in_scroll(page_settings))
         content.addWidget(wrap_in_scroll(page_about_me))
         content.addWidget(wrap_in_scroll(page_about_comfyui))
         content.addWidget(wrap_in_scroll(page_about_launcher))
         # Navigation actions
         pages = {
             "launch": page_launch,
+            "logs": page_logs,
+            "plugins": page_plugins,
             "version": page_version,
             "plugins": page_plugins,
             "models": page_models,
+            "tasks": page_tasks,
+            "settings": page_settings,
             "about": page_about_me,
             "comfyui": page_about_comfyui,
             "about_launcher": page_about_launcher,
@@ -2411,13 +2541,83 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
         def _select_tab(name):
             idx = list(pages.keys()).index(name)
-            content.setCurrentIndex(idx)
+            # 临时关闭 update：setCurrentIndex 会触发一连串的 show / hide / layout
+            # / paint 事件，复杂页（特别是 launch page 上 3 个 QGraphicsDropShadowEffect
+            # 的 section panel）首次 paint 时的 offscreen 渲染 + blur 非常慢，体感就是
+            # "点了标签过了好一会才跳过去". 关掉 update 后，所有中间 paint 都被合并
+            # 到 finally 之后的下一帧, 大幅降低感知卡顿.
+            content.setUpdatesEnabled(False)
+            try:
+                content.setCurrentIndex(idx)
+            finally:
+                content.setUpdatesEnabled(True)
             for k, b in btns.items():
                 b.setChecked(k == name)
 
         for key, b in btns.items():
             b.clicked.connect(lambda _, k=key: _select_tab(k))
         _select_tab("launch")
+
+        # 日志页:启动 tailer。comfy_root_from_config 返回 <comfyui_root>/ComfyUI
+        # (V8 包装目录里 ComfyUI 在子目录;真正的 main.py/user 在那),
+        # log 文件尚未生成时 tailer 阻塞等待,不影响启动。
+        try:
+            from utils.paths import comfy_root_from_config, logs_file as _logs_file
+            _root = comfy_root_from_config(self.config)
+            _log_path = _logs_file(_root)
+            if _log_path.parent.exists() or _log_path.parent.parent.exists():
+                # log 文件或父目录存在才启动;否则连 user/ 都不存在
+                page_logs.set_log_path(_log_path)
+                # 启动时只从文件末尾跟随新行(start_from_beginning=False),不读历史——
+                # 避免把数万行历史一次性灌进主线程冻死 UI。历史在用户首次切到日志页时
+                # 由 showEvent → _load_recent_history 按需读最近 N 行回填。
+                page_logs.start_tailing(start_from_beginning=False)
+            else:
+                page_logs._path_label.setText("(ComfyUI 目录不存在: " + str(_log_path) + ")")
+        except Exception as _e:
+            print(f"[LogViewer] failed to start tailing: {_e}", flush=True)
+
+        # 插件页控制器：页面信号 → PluginService（后台线程 + UiInvoker 派回 UI 线程）。
+        # 控制器必须被持有，否则 GC 后信号连接失效；存在 self._plugin_controller 上。
+        # 包 try/except：services/_invoker 时序或 threading 异常不应拖垮整个 UI 构建。
+        try:
+            import threading
+            self._plugin_controller = PluginController(
+                page_plugins,
+                self.services.plugins,
+                run_in_background=lambda fn: threading.Thread(target=fn, daemon=True).start(),
+                post_to_ui=lambda fn: self._invoker.emit_invoke(fn),
+                sync_deps=self._sync_plugin_deps,
+            )
+            # 正常更新失败的插件 → 二次确认是否强制更新
+            page_plugins.force_update_suggested.connect(self._prompt_plugin_force_update)
+            # 卸载是破坏性操作 → 二次确认（destructive 按钮）
+            page_plugins.uninstall_selected_requested.connect(self._prompt_plugin_uninstall)
+            # 安装按钮 → 弹输入框拿 git URL / CNR id
+            page_plugins.install_btn.clicked.connect(self._prompt_plugin_install)
+            # 检查更新结果回推 → 页面标记 🔄（page 自身消费，但信号是 page 拥有，故在此显式连）
+            page_plugins.outdated_reported.connect(page_plugins.mark_outdated)
+            # 检查更新 / 更新全部：断开 page 默认的信号连接，改走带进度弹窗的版本
+            try:
+                page_plugins.check_updates_btn.clicked.disconnect()
+                page_plugins.update_all_btn.clicked.disconnect()
+                page_plugins.check_updates_btn.clicked.connect(self._do_plugin_check_updates)
+                page_plugins.update_all_btn.clicked.connect(self._do_plugin_update_all)
+            except Exception:
+                pass
+            # 启动后兜底扫描已装列表：延迟 15s，让窗口出现 + 版本检测 + 用户点启动等
+            # 高优先级先跑。若用户这期间已切到插件页（showEvent 触发过），loader 会跳过。
+            # 「切到插件页才扫 + 一直没进去就兜底扫」—— 启动主流程不碰 custom_nodes 的 git。
+            def _plugin_fallback_scan():
+                try:
+                    loader = getattr(self._plugin_controller, "_loader", None)
+                    if loader:
+                        loader.load_if_not_loaded()
+                except Exception:
+                    pass
+            QtCore.QTimer.singleShot(15000, _plugin_fallback_scan)
+        except Exception:
+            self._plugin_controller = None
 
         # 验证路径（在获取版本信息之前）
         # 标记验证状态，用于后续决定是否提示用户配置
@@ -2426,8 +2626,10 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         try:
             from pathlib import Path as P
 
+            # 多环境支持：读激活环境的 comfyui_root
+            _ap = self.get_active_paths()
             comfy_root = Path(
-                self.config.get("paths", {}).get("comfyui_root") or "."
+                _ap.get("comfyui_root") or "."
             ).resolve()
             comfy_dir = comfy_root / "ComfyUI"
             python_path = (
@@ -2745,10 +2947,21 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         try:
             if not hasattr(self, "_version_workers"):
                 self._version_workers = {}
+            if not hasattr(self, "_env_token"):
+                self._env_token = 0
 
             worker_id = f"{worker_type}_{attempt}"
             worker = worker_class(self, attempt)
-            worker.versionReady.connect(callback)
+            # 环境切换 token 校验：worker 启动时捕获当前 token，回调时若 token 已变
+            # （环境切换过），丢弃结果——避免旧环境的 worker 迟到结果覆盖新环境。
+            launch_token = self._env_token
+
+            def _guarded_callback(*args, **kwargs):
+                if self._env_token != launch_token:
+                    return  # 环境已切换，丢弃旧结果
+                callback(*args, **kwargs)
+
+            worker.versionReady.connect(_guarded_callback)
 
             # 连接重试信号
             def on_retry(attempt_num):
@@ -2970,6 +3183,107 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             except Exception:
                 pass
 
+    def get_active_paths(self):
+        """Return the active environment's paths sub-dict.
+
+        多环境支持：解析 ``config["environments"]`` 里激活的那个环境，
+        返回形如 ``{"comfyui_root": ..., "python_path": ...}`` 的子 dict。
+        调用方（build_launch_params 等）应优先用这个，而不是直接读
+        ``config["paths"]``。未迁移时回退到老 paths 段。与 HeadlessAppContext
+        同名方法行为一致（鸭子类型约定）。
+        """
+        return resolve_active_paths(self.config)
+
+    def refresh_after_env_switch(self):
+        """切换激活环境后，集中刷新所有依赖环境路径的 UI。
+
+        多环境支持：环境切换会改变 comfyui_root / python_path，进而影响
+        版本信息、插件列表、模型库、日志文件路径等。这些页面各自缓存了
+        旧环境的数据，必须显式刷新。本方法是唯一的统一刷新入口，两个
+        切换入口（启动页下拉、设置页管理）都应调用它。
+
+        每项刷新都包在 try/except 里，单个页面刷新失败不影响其他页面。
+        """
+        # 自增环境 token：让正在跑的旧 version worker 回调时丢弃结果（P1 竞态防护）
+        try:
+            self._env_token = getattr(self, "_env_token", 0) + 1
+        except Exception:
+            pass
+
+        # 1. 启动页版本信息（Python/Torch/前端/内核/GPU 等）
+        try:
+            self.get_version_info("all")
+        except Exception:
+            pass
+
+        pages = getattr(self, "_new_pages", {}) or {}
+
+        # 2. 版本管理页：内核版本标签 + git 提交历史
+        try:
+            version_page = pages.get("version")
+            if version_page is not None and hasattr(version_page, "_refresh_kernel_section"):
+                version_page._refresh_kernel_section()
+        except Exception:
+            pass
+
+        # 3. 模型页：外置模型库列表（依赖 comfyui_root/extra_model_paths.yaml）
+        try:
+            models_page = pages.get("models")
+            if models_page is not None and hasattr(models_page, "refresh_from_config"):
+                models_page.refresh_from_config()
+        except Exception:
+            pass
+
+        # 4. 插件页：强制重扫 custom_nodes（loader 缓存了"已加载"状态，必须 load() 强制）
+        try:
+            ctrl = getattr(self, "_plugin_controller", None)
+            if ctrl is not None:
+                loader = getattr(ctrl, "_loader", None)
+                if loader is not None:
+                    loader.load()
+        except Exception:
+            pass
+
+        # 5. 日志页：重定向 tailer 到新环境的 comfyui.log
+        try:
+            page_logs = pages.get("logs")
+            if page_logs is not None:
+                from utils.paths import comfy_root_from_config, logs_file as _logs_file
+                _root = comfy_root_from_config(self.config)
+                _log_path = _logs_file(_root)
+                if hasattr(page_logs, "stop_tailing"):
+                    page_logs.stop_tailing()
+                page_logs.set_log_path(_log_path)
+                if hasattr(page_logs, "start_tailing"):
+                    page_logs.start_tailing(start_from_beginning=False)
+        except Exception:
+            pass
+
+    def has_active_background_tasks(self) -> bool:
+        """是否有进行中的后台任务（环境切换前检查用）。
+
+        后台任务基于当前环境路径操作（更新内核/插件、检查更新等），切换环境
+        会让正在跑的任务读到新路径，可能操作错误环境甚至写坏文件。所以切换前
+        若有活跃后台任务，应阻止切换（不像 ComfyUI 进程那样可以强行停——后台
+        任务涉及 git/cm-cli 子进程，强杀风险大）。
+
+        覆盖范围：
+        - BackgroundTaskRegistry 里显式注册的任务（检查更新/更新全部）
+        - _update_running 标志（核心更新流程）
+        """
+        try:
+            registry = getattr(self, "_bg_task_registry", None)
+            if registry is not None and registry.count_active() > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_update_running", False):
+                return True
+        except Exception:
+            pass
+        return False
+
     def save_config(self):
         try:
             self.services.config.update_launch_options(
@@ -3086,12 +3400,33 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         try:
             from ui_qt.widgets.progress_dialog import ProgressDialog
 
+            # 注册后台任务(让“后台运行”按钮可用,任务面板能看到进度)
+            registry = getattr(self, "_bg_task_registry", None)
+            task_id = registry.register("更新 ComfyUI") if registry else None
+
             pd = ProgressDialog(
                 self,
                 title="正在更新",
                 theme_manager=getattr(self, "theme_manager", None),
                 show_cancel=True,
+                show_background=True,
             )
+            if registry and task_id:
+                registry.set_dialog(task_id, pd)
+                registry.update(task_id, status="正在检查更新...")
+
+            def _on_background():
+                # 同步注册表:面板上能看到状态变化
+                if registry and task_id:
+                    try:
+                        registry.update(task_id, status="已转入后台运行...")
+                    except Exception:
+                        pass
+                # 弹窗本身保持显示(_apply_progress 会跳过 UI 更新),
+                # 用户点“取消”能直接终止
+
+            pd.set_background_callback(_on_background)
+
             pd.set_status("正在检查更新...")
 
             # 设置取消回调：恢复按钮状态并终止后台 git 进程
@@ -3148,11 +3483,33 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             def _apply_progress(text, percent):
                 if pd is None or pd.is_cancelled():
                     return
+                # 后台模式:只更新注册表(面板看得到),不动弹窗 UI
+                if pd.is_backgrounded():
+                    if registry and task_id:
+                        try:
+                            registry.update(
+                                task_id,
+                                status=text,
+                                progress=(percent, 100) if percent is not None else None,
+                            )
+                        except Exception:
+                            pass
+                    return
                 try:
                     pd.set_status(text)
                     pd.set_progress(percent if percent is not None else None)
                 except Exception:
                     pass
+                # 弹窗可见时也同步注册表,这样点“后台运行”时面板已经有最新状态
+                if registry and task_id:
+                    try:
+                        registry.update(
+                            task_id,
+                            status=text,
+                            progress=(percent, 100) if percent is not None else None,
+                        )
+                    except Exception:
+                        pass
 
             try:
                 # 检查是否已取消
@@ -3279,6 +3636,23 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                 # _update_running / on_done 恢复（由 _force_update 自己负责），
                 # 否则按钮会被提前恢复、用户可再次点“更新”导致并发。
                 offered_force_update = False
+                # 后台任务收尾:先根据 core_res 状态打标签,
+                # 再 mark_complete 弹完成态(后台模式下由面板呈现)。
+                try:
+                    _ok = bool(core_res) and not (isinstance(core_res, dict) and core_res.get("error"))
+                    if registry and task_id:
+                        try:
+                            registry.complete(task_id, error=not _ok)
+                        except Exception:
+                            pass
+                    if pd:
+                        try:
+                            _label = "更新完成 ✓" if _ok else "更新完成(有失败项)"
+                            pd.mark_complete(_label)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 try:
                     # 关闭进度弹窗
                     try:
@@ -3597,6 +3971,49 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
         open_web(self)
 
+    def _apply_comfyui_running_ui(self, running: bool) -> None:
+        """把 ComfyUI 运行状态同步到大按钮与托盘；拖动窗口期间推迟到释放后。"""
+        if getattr(self, "_in_size_move", False):
+            self._pending_running_ui = running
+            return
+        self._do_apply_comfyui_running_ui(running)
+
+    def _do_apply_comfyui_running_ui(self, running: bool) -> None:
+        state = "running" if running else "idle"
+        btn = self.big_btn
+        if btn._state != state:
+            btn.set_state(state)
+        if running:
+            btn.set_display("正常运行", "点击停止")
+        else:
+            btn.set_display("🚀 一键启动")
+        tray = getattr(self, "_tray", None)
+        if tray is not None and tray.available:
+            tray.update_comfyui_status(running)
+
+    def _flush_pending_ui_after_move(self) -> None:
+        pending = getattr(self, "_pending_running_ui", None)
+        if pending is None:
+            return
+        self._pending_running_ui = None
+        self._do_apply_comfyui_running_ui(pending)
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0231:  # WM_ENTERSIZEMOVE
+                    self._in_size_move = True
+                elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
+                    self._in_size_move = False
+                    self._flush_pending_ui_after_move()
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
     def _is_comfyui_running(self) -> bool:
         pm = getattr(self, "process_manager", None)
         try:
@@ -3621,6 +4038,15 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             return False
 
     def closeEvent(self, event):
+        """主窗口关闭事件。
+
+        分三种进入场景：
+        1. 从托盘菜单退出 -> 直接走完整退出流程（不弹对话框）
+        2. 从主窗口点 X -> 根据 ui_settings 中的选项：
+           a. 如果 ask_every_time=True，弹出“最小化到托盘 / 退出 / 取消”对话框（可记住）
+           b. 如果 ask_every_time=False，直接按 minimize_to_tray_on_close 执行
+        3. 选择“退出”且 ComfyUI 运行中 -> 弹出原有的 3 选项对话框
+        """
         logger = getattr(self, "logger", None)
         try:
             if logger:
@@ -3628,73 +4054,569 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         except Exception:
             pass
 
-        running = False
-        try:
-            running = self._is_comfyui_running()
-        except Exception:
-            running = False
+        # ---- 场景 1a: 从托盘菜单退出（保留 ComfyUI）----
+        if getattr(self, "_tray_quit_requested", False):
+            self._perform_shutdown(event)
+            return
 
-        try:
-            if logger:
-                logger.info("ComfyUI 运行状态: %s", running)
-        except Exception:
-            pass
-        if running:
+        # ---- 场景 1b: 从托盘菜单退出并关闭 ComfyUI ----
+        if getattr(self, "_tray_quit_and_stop_requested", False):
             try:
-                from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
+                pm = getattr(self, "process_manager", None)
+                if pm and hasattr(pm, "stop_comfyui_sync"):
+                    pm.stop_comfyui_sync()
+            except Exception as e:
+                try:
+                    if getattr(self, "logger", None):
+                        self.logger.warning("从托盘退出时停止 ComfyUI 失败: %s", e)
+                except Exception:
+                    pass
+            self._perform_shutdown(event)
+            return
 
-                dialog = CustomConfirmDialog(
-                    self,
-                    title="退出确认",
-                    content=(
-                        "检测到 ComfyUI 仍在运行。\n\n"
-                        "您可以选择停止服务并退出，或者仅退出启动器（保持服务后台运行）。"
-                    ),
-                    buttons=[
-                        {"text": "取消", "role": "normal"},
-                        {"text": "仅退出启动器", "role": "normal"},
-                        {"text": "停止服务并退出", "role": "destructive"},
-                    ],
-                    default_index=2,
-                    theme_manager=getattr(self, "theme_manager", None),
-                )
-                if dialog.exec_() == QtWidgets.QDialog.Accepted:
-                    idx = dialog.get_result()
-                else:
-                    idx = 0  # Cancel
-            except Exception:
-                idx = 0  # Default to cancel on error
-
-            # 0: 取消
-            if idx == 0:
-                try:
-                    event.ignore()
-                except Exception:
-                    pass
-                return
-            # 2: 停止并退出
-            if idx == 2:
-                try:
-                    self._shutting_down = True
-                except Exception:
-                    pass
-                try:
-                    pm = getattr(self, "process_manager", None)
-                    if pm and hasattr(pm, "stop_comfyui_sync"):
-                        pm.stop_comfyui_sync()
-                except Exception:
-                    pass
-            else:
-                # 1: 仅退出启动器
-                try:
-                    self._shutting_down = True
-                except Exception:
-                    pass
-        else:
+        # ---- 场景 2: 从主窗口点 X ----
+        action = self._resolve_close_action()
+        if action == "minimize":
+            # 不退出，隐藏主窗口。进程保持运行，托盘接管。
             try:
-                self._shutting_down = True
+                event.ignore()
             except Exception:
                 pass
+            try:
+                self.hide()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "_tray", None) and self._tray.available:
+                    self._tray.show_first_time_hint()
+            except Exception:
+                pass
+            try:
+                if logger:
+                    logger.info("主窗口已最小化到系统托盘")
+            except Exception:
+                pass
+            return
+        if action == "cancel":
+            try:
+                event.ignore()
+            except Exception:
+                pass
+            return
+
+        # ---- 场景 3: 退出，但 ComfyUI 运行中，需问你怎么退 ----
+        try:
+            if self._is_comfyui_running():
+                idx = self._prompt_comfyui_exit_mode()
+                if idx == 0:  # 取消
+                    try:
+                        event.ignore()
+                    except Exception:
+                        pass
+                    return
+                if idx == 2:  # 停止并退出
+                    try:
+                        pm = getattr(self, "process_manager", None)
+                        if pm and hasattr(pm, "stop_comfyui_sync"):
+                            pm.stop_comfyui_sync()
+                    except Exception:
+                        pass
+                # idx == 1 (仅退出启动器) 不停 ComfyUI
+        except Exception:
+            pass
+
+        self._perform_shutdown(event)
+
+    def _resolve_close_action(self):
+        """根据配置 + 交互得出“最小化 / 退出 / 取消”中的一个。"""
+        logger = getattr(self, "logger", None)
+        try:
+            ui = self.config.get("ui_settings", {}) if isinstance(self.config, dict) else {}
+        except Exception:
+            ui = {}
+        ask = bool(ui.get("minimize_to_tray_ask_every_time", True))
+        minimize_default = bool(ui.get("minimize_to_tray_on_close", False))
+        tray_available = bool(getattr(self, "_tray", None) and self._tray.available)
+
+        if not ask:
+            # 不弹对话框，直接按上次选择执行
+            if minimize_default and tray_available:
+                return "minimize"
+            return "quit"
+
+        # 交互式对话框
+        try:
+            from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
+        except Exception:
+            return "quit"
+
+        if not tray_available:
+            # 托盘不可用，只给退出选项
+            dlg = CustomConfirmDialog(
+                parent=self,
+                title="关闭主窗口",
+                content="本机不支持系统托盘，关闭主窗口将直接退出启动器。\n\n退出启动器后，如果 ComfyUI 仍在运行会继续后台运行。",
+                buttons=[
+                    {"text": "取消", "role": "normal"},
+                    {"text": "退出启动器", "role": "destructive"},
+                ],
+                default_index=1,
+                theme_manager=getattr(self, "theme_manager", None),
+            )
+            if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.get_result() == 1:
+                return "quit"
+            return "cancel"
+
+        # 托盘可用：三选项 + 记住勾选
+        dlg = CustomConfirmDialog(
+            parent=self,
+            title="关闭主窗口",
+            content=(
+                "选择如下一种方式关闭主窗口：\n\n"
+                "• 最小化到托盘：启动器后台继续运行，ComfyUI 如在运行也会保持。\n"
+                "• 退出启动器：完全退出，如果 ComfyUI 在运行会继续后台运行。"
+            ),
+            buttons=[
+                {"text": "取消", "role": "normal"},
+                {"text": "最小化到托盘", "role": "primary"},
+                {"text": "退出启动器", "role": "destructive"},
+            ],
+            # 弹窗 = 强制用户做一次明确选择：默认焦点放在「取消」上。
+            # 之前默认到 1/2 会让 Enter 直接最小化或退出启动器，违反「每次都提醒」的语义。
+            default_index=0,
+            theme_manager=getattr(self, "theme_manager", None),
+            remember_checkbox_text="记住我的选择，下次不再提醒",
+            remember_checked=minimize_default,
+        )
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return "cancel"
+        idx = dlg.get_result()
+        if idx is None:
+            return "cancel"
+
+        remember = dlg.is_remember_checked()
+        try:
+            if logger:
+                logger.info(
+                    "关闭确认选项: idx=%s remember=%s", idx, remember
+                )
+        except Exception:
+            pass
+
+        if remember:
+            try:
+                if isinstance(self.config, dict):
+                    ui2 = self.config.setdefault("ui_settings", {})
+                else:
+                    self.config = {}
+                    ui2 = self.config.setdefault("ui_settings", {})
+                ui2["minimize_to_tray_ask_every_time"] = False
+                ui2["minimize_to_tray_on_close"] = (idx == 1)
+                if hasattr(self, "services") and getattr(self.services, "config", None):
+                    try:
+                        self.services.config.save(self.config)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if idx == 1:
+            return "minimize"
+        if idx == 2:
+            return "quit"
+        return "cancel"
+
+    def _prompt_comfyui_exit_mode(self):
+        """当选择退出但 ComfyUI 仍在运行时，弹原有的 3 选项对话框。返回 idx。"""
+        try:
+            from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
+
+            dlg = CustomConfirmDialog(
+                self,
+                title="退出确认",
+                content=(
+                    "检测到 ComfyUI 仍在运行。\n\n可选择停止服务后退出，或者仅退出启动器（保持服务后台运行）。"
+                ),
+                buttons=[
+                    {"text": "取消", "role": "normal"},
+                    {"text": "仅退出启动器", "role": "normal"},
+                    {"text": "停止服务并退出", "role": "destructive"},
+                ],
+                default_index=2,
+                theme_manager=getattr(self, "theme_manager", None),
+            )
+            if dlg.exec_() == QtWidgets.QDialog.Accepted:
+                return dlg.get_result() or 0
+        except Exception:
+            pass
+        return 0
+
+    def _prompt_plugin_force_update(self, names):
+        """正常更新后仍有插件落后 → 二次确认是否强制更新（git stash + pull）。
+
+        罕见路径：比如本地 MieNodes 从仓库直接同步（dirty 树），cm-cli 正常更新会拒，
+        这里提示用户是否对这些插件强制更新。默认「取消」——二次确认要谨慎。
+        """
+        try:
+            if not names:
+                return
+            from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
+
+            listing = "\n".join(str(n) for n in names)
+            dlg = CustomConfirmDialog(
+                self,
+                title="部分插件更新失败",
+                content=(
+                    "以下插件正常更新未成功（可能本地有改动，例如从仓库直接同步的插件）：\n\n"
+                    f"{listing}\n\n"
+                    "是否对它们强制更新？（会先 git stash 本地改动，再 git pull --ff-only）"
+                ),
+                buttons=[
+                    {"text": "取消", "role": "normal"},
+                    {"text": "强制更新", "role": "destructive"},
+                ],
+                default_index=0,
+                theme_manager=getattr(self, "theme_manager", None),
+            )
+            if dlg.exec_() == QtWidgets.QDialog.Accepted and (dlg.get_result() or 0) == 1:
+                ctrl = getattr(self, "_plugin_controller", None)
+                if ctrl is not None:
+                    ctrl.apply_force_update(list(names))
+        except Exception:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("插件强制更新确认弹窗失败", exc_info=True)
+            except Exception:
+                pass
+
+    def _sync_plugin_deps(self):
+        """强制更新插件后，复用普通内核更新的「同步依赖库」流程。
+
+        直接调 update_service.sync_requirements_files()——它自身按 auto_update_deps_var
+        网关（_needs_consistency），与内核更新按钮完全同一套。注意：该流程只同步
+        ComfyUI 内核 requirements*.txt，不含各插件自己的 requirements.txt（按既定设计）。
+        """
+        try:
+            if hasattr(self, "services") and hasattr(self.services, "update"):
+                self.services.update.sync_requirements_files()
+        except Exception:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("插件强制更新后同步依赖库失败", exc_info=True)
+            except Exception:
+                pass
+
+    def _prompt_plugin_uninstall(self, dir_names):
+        """卸载选中插件 → 二次确认（破坏性，不可撤销）。默认「取消」。
+
+        与 _prompt_plugin_force_update 同构：page 发 uninstall_selected_requested，
+        这里弹框；同意后调 controller.apply_uninstall（它循环 svc.uninstall）。
+        """
+        try:
+            if not dir_names:
+                return
+            from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
+
+            listing = "\n".join(str(n) for n in dir_names)
+            dlg = CustomConfirmDialog(
+                self,
+                title="卸载确认",
+                content=(
+                    f"将卸载以下 {len(dir_names)} 个插件：\n\n"
+                    f"{listing}\n\n"
+                    "此操作不可撤销（cm-cli uninstall 会删除目录）。确认卸载？"
+                ),
+                buttons=[
+                    {"text": "取消", "role": "normal"},
+                    {"text": "卸载", "role": "destructive"},
+                ],
+                default_index=0,
+                theme_manager=getattr(self, "theme_manager", None),
+            )
+            if dlg.exec_() == QtWidgets.QDialog.Accepted and (dlg.get_result() or 0) == 1:
+                ctrl = getattr(self, "_plugin_controller", None)
+                if ctrl is not None:
+                    ctrl.apply_uninstall(list(dir_names))
+        except Exception:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("插件卸载确认弹窗失败", exc_info=True)
+            except Exception:
+                pass
+
+    def _prompt_plugin_install(self):
+        """安装插件 → 弹输入框拿 git URL / CNR id，调 controller.request_install。
+
+        用 CustomConfirmDialog 的 show_input 模式（复用主题化样式 + StyledLineEdit）。
+        空输入不触发安装。
+        """
+        try:
+            from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
+
+            dlg = CustomConfirmDialog(
+                self,
+                title="安装插件",
+                content="输入插件的 git 仓库 URL 或 CNR id（如 ComfyUI-KJNodes）：",
+                buttons=[
+                    {"text": "取消", "role": "normal"},
+                    {"text": "安装", "role": "primary"},
+                ],
+                default_index=1,
+                theme_manager=getattr(self, "theme_manager", None),
+                show_input=True,
+                input_placeholder="https://github.com/...  或  CNR-id",
+            )
+            if dlg.exec_() == QtWidgets.QDialog.Accepted and (dlg.get_result() or 0) == 1:
+                spec = dlg.get_input_value()
+                if spec:
+                    ctrl = getattr(self, "_plugin_controller", None)
+                    if ctrl is not None:
+                        ctrl.request_install(spec)
+        except Exception:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("插件安装输入弹窗失败", exc_info=True)
+            except Exception:
+                pass
+
+    def _do_plugin_check_updates(self):
+        """检查更新：带逐插件进度 + 取消 + 后台运行（注册到后台任务注册表，可找回）。"""
+        ctrl = getattr(self, "_plugin_controller", None)
+        if ctrl is None:
+            return
+        try:
+            from ui_qt.widgets.progress_dialog import ProgressDialog
+            registry = getattr(self, "_bg_task_registry", None)
+            task_id = registry.register("检查更新") if registry else None
+            pd = ProgressDialog(self, title="检查更新", theme_manager=getattr(self, "theme_manager", None),
+                                show_cancel=True, show_background=True)
+            if registry and task_id:
+                registry.set_dialog(task_id, pd)  # 持有弹窗引用，供面板找回
+            pd.set_status("正在获取已装插件列表...")
+            pd.set_progress(0, maximum=0)  # 初始脉冲
+            pd.show()
+            QtWidgets.QApplication.processEvents()
+
+            def on_progress(cur, total, name):
+                # 同步注册表（面板列表的进度条/状态文字靠它）
+                if registry and task_id:
+                    label = f"正在查询第 {cur}/{total} 个插件..." + (f"  {name}" if name else "") if total > 0 else ""
+                    registry.update(task_id, status=label, progress=(cur, total) if total > 0 else (0, 0))
+                # 取消或已后台运行 → 不更新弹窗 UI（任务可能仍在跑，结果按各自标志处理）
+                if pd.is_cancelled() or pd.is_backgrounded():
+                    return
+                if total > 0:
+                    pd.set_progress(cur, maximum=total)
+                    plabel = f"正在查询第 {cur}/{total} 个插件..." + (f"  {name}" if name else "")
+                    pd.set_status(plabel)
+
+            def on_done(outdated, remote_dates):
+                try:
+                    page = self._find_plugins_page()
+                    if page is not None:
+                        # 结果无论取消/后台都回填列表（用户能看到标记）
+                        page.mark_outdated(outdated, remote_dates)
+                    n = len(outdated)
+                    done_msg = (f"检查完成：发现 {n} 个插件有可用更新" if n
+                                else "检查完成：所有插件均为最新版本")
+                    # 关键：先把弹窗更新到完成态（progress=满 + 状态文字 + 隐藏取消按钮）。
+                    # 后台模式下 on_progress 跳过了弹窗 UI，不更新到这里，restore 找回时会看到
+                    # 进度停在中途、与面板「已完成」不一致。mark_complete 还会隐藏取消按钮
+                    # （已完成的任务不该再有取消选项）。这里统一同步。
+                    try:
+                        pd.mark_complete(done_msg + " ✓")
+                    except Exception:
+                        pass
+                    # 注册表标记完成（驱动按钮变绿）
+                    if registry and task_id:
+                        registry.complete(task_id)
+                        registry.update(task_id, status=done_msg)
+                    # 取消了：直接关弹窗 + 清任务
+                    if pd.is_cancelled():
+                        try:
+                            pd.close()
+                        except Exception:
+                            pass
+                        return
+                    if pd.is_backgrounded():
+                        # 后台运行：弹窗已隐藏但已更新到完成态（restore 可见），状态栏提示 + 按钮变绿。
+                        # 不再自动 remove：保留为本次启动的完成历史（问题3），用户可手动清。
+                        self._notify_plugins_result(done_msg)
+                        return
+                    # 前台：已显示结果，延迟关闭（保留历史）
+                    def _close():
+                        try:
+                            pd.close()
+                        except Exception:
+                            pass
+                    QtCore.QTimer.singleShot(1500, _close)
+                except Exception:
+                    try:
+                        pd.close()
+                    except Exception:
+                        pass
+                    if registry and task_id:
+                        registry.remove(task_id)
+
+            ctrl.run_check_updates(on_progress=on_progress, on_done=on_done)
+        except Exception:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("插件检查更新弹窗失败", exc_info=True)
+            except Exception:
+                pass
+
+    def _do_plugin_update_all(self):
+        """更新全部：带脉冲进度 + 取消 + 后台运行（注册到后台任务注册表，可找回）。
+        cm-cli update all 无中间进度，用脉冲。"""
+        ctrl = getattr(self, "_plugin_controller", None)
+        if ctrl is None:
+            return
+        try:
+            from ui_qt.widgets.progress_dialog import ProgressDialog
+            registry = getattr(self, "_bg_task_registry", None)
+            task_id = registry.register("更新全部") if registry else None
+            status_init = "正在更新全部插件（含 pip 依赖修复，可能需要几分钟）..."
+            pd = ProgressDialog(self, title="更新全部", theme_manager=getattr(self, "theme_manager", None),
+                                show_cancel=True, show_background=True)
+            if registry and task_id:
+                registry.set_dialog(task_id, pd)
+                registry.update(task_id, status=status_init)
+            pd.set_status(status_init)
+            pd.set_progress(0, maximum=0)  # 脉冲
+            pd.show()
+            QtWidgets.QApplication.processEvents()
+
+            def on_status(text):
+                if registry and task_id:
+                    registry.update(task_id, status=text)
+                if pd.is_cancelled() or pd.is_backgrounded():
+                    return
+                try:
+                    pd.set_status(text)
+                except Exception:
+                    pass
+
+            def on_done():
+                try:
+                    page = self._find_plugins_page()  # 列表刷新在 controller._populate_from_service 里
+                    done_msg = "插件更新完成"
+                    # 同步弹窗到完成态（后台模式下 on_progress 跳过了弹窗 UI，这里统一更新；
+                    # mark_complete 还会隐藏取消按钮——已完成的任务不该再有取消选项）
+                    try:
+                        pd.mark_complete(done_msg + " ✓（列表已刷新）")
+                    except Exception:
+                        pass
+                    if registry and task_id:
+                        registry.complete(task_id)
+                        registry.update(task_id, status=done_msg)
+                    if pd.is_cancelled():
+                        try:
+                            pd.close()
+                        except Exception:
+                            pass
+                        return
+                    if pd.is_backgrounded():
+                        # 后台：弹窗已更新到完成态，状态栏提示。不自动 remove（保留历史）
+                        self._notify_plugins_result(done_msg)
+                        return
+                    # 前台：已显示结果，延迟关闭（保留历史，不 remove）
+                    def _close():
+                        try:
+                            pd.close()
+                        except Exception:
+                            pass
+                    QtCore.QTimer.singleShot(1500, _close)
+                except Exception:
+                    try:
+                        pd.close()
+                    except Exception:
+                        pass
+                    if registry and task_id:
+                        registry.remove(task_id)
+
+            ctrl.run_update_all(on_status=on_status, on_done=on_done)
+        except Exception:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("插件更新全部弹窗失败", exc_info=True)
+            except Exception:
+                pass
+
+    def _notify_plugins_result(self, message):
+        """后台运行完成时的轻量提示（statusBar 短暂显示，不抢焦点）。"""
+        try:
+            sb = self.statusBar()
+            if sb is not None:
+                sb.showMessage(message, 4000)
+        except Exception:
+            pass
+
+    def _refresh_bg_tasks_nav(self):
+        """注册表变化 → 刷新「后台任务」nav 按钮文字（badge 效果）+ 同步页面。
+
+        - 有活动任务：nav 显示「📋 后台任务 (N)」（N=进行中数）
+        - 无活动但有完成历史：显示「📋 后台任务 ✓」（提示有可查看的历史）
+        - 全空：恢复「📋 后台任务」
+        page 自身连了注册表信号会自动 refresh，这里只补 nav 按钮文字。
+        """
+        try:
+            registry = getattr(self, "_bg_task_registry", None)
+            btn_map = getattr(self, "_nav_btn_map", None) or {}
+            btn = btn_map.get("tasks")
+            if registry is None or btn is None:
+                return
+            n_active = registry.count_active()
+            n_done = registry.count_done_unread()
+            base = "📋 后台任务"
+            if n_active > 0:
+                btn.setText(f"{base} ({n_active})")
+            elif n_done > 0:
+                btn.setText(f"{base} ✓")
+            else:
+                btn.setText(base)
+        except Exception:
+            pass
+
+    def _refresh_logs_nav(self, marker: str = ""):
+        """LogViewerPage 收到信号 → 在「实时日志」nav 按钮上做未读提示。
+
+        - marker == "__viewed__" / "__cleared__":用户切到了日志页,或关掉了
+          「新日志提醒」,清掉未读标记,恢复正常标题
+        - 其他值(含现在的 "__new__",以及历史发出的级别字符串如 INFO/WARNING/ERROR):
+          仅作为"有未读"的信号,按钮加 "* " 前缀。不再按级别区分颜色
+          (历史上的绿/黄/红 三色灯逻辑已移除、过于花式)。
+
+        只在用户不在日志页时提示;到了日志页(showEvent)即清零。
+        """
+        try:
+            btn_map = getattr(self, "_nav_btn_map", None) or {}
+            btn = btn_map.get("logs")
+            if btn is None:
+                return
+            base = "📋 ComfyUI 实时日志"
+            if marker in ("__viewed__", "__cleared__"):
+                btn.setText(base)
+                return
+            btn.setText("* " + base)
+        except Exception:
+            pass
+
+
+        """安全拿到 plugins page（outdated_reported 回推时用），找不到返回 None。"""
+        try:
+            return getattr(self, "_plugins_page", None)
+        except Exception:
+            return None
+
+
+    def _perform_shutdown(self, event):
+        """真正退出的后续流程：站伏 workers、关窗口、QApplication.quit。与原 closeEvent 后半段一致。"""
+        logger = getattr(self, "logger", None)
+        try:
+            self._shutting_down = True
+        except Exception:
+            pass
 
         # 停止所有版本检测 workers
         try:
@@ -3709,6 +4631,13 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             except Exception:
                 pass
 
+        # 托盘同步清理（不要在主窗口销毁后还在亮着）
+        try:
+            if getattr(self, "_tray", None):
+                self._tray.shutdown()
+        except Exception:
+            pass
+
         try:
             super().closeEvent(event)
         except Exception:
@@ -3717,7 +4646,6 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             except Exception:
                 pass
 
-        # 确保应用完全退出
         try:
             if logger:
                 logger.info("调用 QApplication.quit()")
@@ -3732,6 +4660,60 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                 logger.info("closeEvent 完成")
         except Exception:
             pass
+
+    def _show_from_tray(self):
+        """从托盘恢复主窗口：显示、窗口置顶、不启动最大化。"""
+        try:
+            if self.isMinimized():
+                self.showNormal()
+        except Exception:
+            pass
+        try:
+            self.show()
+        except Exception:
+            pass
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "logger", None):
+                self.logger.info("从系统托盘恢复主窗口")
+        except Exception:
+            pass
+
+    def _quit_from_tray(self):
+        """从托盘菜单退出：设置标志位后调用 close()，走真正退出流程。"""
+        try:
+            if getattr(self, "logger", None):
+                self.logger.info("从系统托盘退出启动器")
+        except Exception:
+            pass
+        self._tray_quit_requested = True
+        try:
+            self.close()
+        except Exception:
+            try:
+                QtWidgets.QApplication.quit()
+            except Exception:
+                pass
+
+    def _quit_from_tray_and_stop(self):
+        """从托盘菜单退出并关闭 ComfyUI：走 closeEvent 场景 1b，先停服务再退出。"""
+        try:
+            if getattr(self, "logger", None):
+                self.logger.info("从系统托盘退出并关闭 ComfyUI")
+        except Exception:
+            pass
+        self._tray_quit_and_stop_requested = True
+        try:
+            self.close()
+        except Exception:
+            try:
+                QtWidgets.QApplication.quit()
+            except Exception:
+                pass
 
     def run(self):
         # 首先检查是否有待处理的启动器更新
@@ -3773,6 +4755,8 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
 
             def _sync():
                 try:
+                    if getattr(self, "_in_size_move", False):
+                        return
                     # 强制用主线程重绘，避免早期跨线程 setText 失效
                     labs = list(self._version_label_refs or [])
                     # 必须与 items 列表顺序一致: 内核, 前端, 模板库, Python, Torch, Git
@@ -3788,7 +4772,9 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                     for i in range(0, len(vals) * 2, 2):
                         if i < len(labs):
                             try:
-                                labs[i].setText(vals[i // 2])
+                                new_text = vals[i // 2]
+                                if labs[i].text() != new_text:
+                                    labs[i].setText(new_text)
                             except Exception:
                                 pass
                 except Exception:
@@ -3800,6 +4786,28 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         except Exception:
             pass
         self.show()
+
+        # 初始化系统托盘（不可用时静默降级）
+        try:
+            self._tray = LauncherTray(
+                app=self, theme_manager=self.theme_manager, parent=self
+            )
+            if not self._tray.init():
+                if not self._tray_warned_unavailable:
+                    self._tray_warned_unavailable = True
+                    if getattr(self, "logger", None):
+                        self.logger.info("系统不可用托盘，关闭主窗口将直接退出启动器")
+        except Exception as e:
+            try:
+                if getattr(self, "logger", None):
+                    self.logger.warning("托盘初始化失败: %s", e)
+            except Exception:
+                pass
+        else:
+            # 连接信号：从托盘恢复主窗口 / 从托盘退出
+            self._tray.show_window_requested.connect(self._show_from_tray)
+            self._tray.quit_requested.connect(self._quit_from_tray)
+            self._tray.quit_and_stop_requested.connect(self._quit_from_tray_and_stop)
 
         # 延迟启动版本检测，让窗口先显示出来
         QtCore.QTimer.singleShot(0, lambda: self._start_version_detection())
@@ -3833,8 +4841,8 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                 self.logger.info(
                     "updateGeometry 后窗口大小: %dx%d", self.width(), self.height()
                 )
-                # 检查根目录配置
-                comfy_root = self.config.get("paths", {}).get("comfyui_root", "NOT_SET")
+                # 检查根目录配置（多环境：激活环境的 comfyui_root）
+                comfy_root = self.get_active_paths().get("comfyui_root", "NOT_SET")
                 self.logger.info("当前根目录配置: %s", comfy_root)
         except Exception:
             pass
@@ -3890,8 +4898,10 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         from ui_qt.widgets.custom_confirm_dialog import CustomConfirmDialog
 
         while True:
+            # 多环境支持：读激活环境的 comfyui_root
+            _ap = self.get_active_paths()
             comfy_root = Path(
-                self.config.get("paths", {}).get("comfyui_root") or "."
+                _ap.get("comfyui_root") or "."
             ).resolve()
             comfy_dir = comfy_root / "ComfyUI"
 
@@ -3935,8 +4945,12 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                     selected_comfy_dir.exists()
                     and (selected_comfy_dir / "main.py").exists()
                 ):
-                    # 验证通过，保存配置
-                    self.config.setdefault("paths", {})["comfyui_root"] = d
+                    # 验证通过，保存配置（多环境：写激活环境的 comfyui_root）
+                    try:
+                        from config.migrations import update_active_env
+                        update_active_env(self.config, comfyui_root=d)
+                    except Exception:
+                        self.config.setdefault("paths", {})["comfyui_root"] = d
                     try:
                         saved_config = self.services.config.save(self.config)
                         if saved_config is not None:
@@ -3954,16 +4968,22 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                         else:
                             from utils import paths as PATHS
 
-                            configured = self.config.get("paths", {}).get(
+                            # 多环境支持：兜底用激活环境的 python_path
+                            configured = self.get_active_paths().get(
                                 "python_path", "python_embeded/python.exe"
                             )
                             py = PATHS.resolve_python_exec(
                                 selected_comfy_dir, configured
                             )
                             self.python_exec = str(py)
-                        self.config.setdefault("paths", {})["python_path"] = (
-                            self.python_exec
-                        )
+                        # 多环境支持：写激活环境的 python_path
+                        try:
+                            from config.migrations import update_active_env
+                            update_active_env(self.config, python_path=self.python_exec)
+                        except Exception:
+                            self.config.setdefault("paths", {})["python_path"] = (
+                                self.python_exec
+                            )
                         try:
                             self.services.config.save(self.config)
                         except Exception:

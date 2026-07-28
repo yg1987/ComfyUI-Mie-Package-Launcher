@@ -1,778 +1,529 @@
-"""Local discovery and domain types for ComfyUI custom-node plugins.
+"""插件（custom_nodes）管理服务 —— 包装 ComfyUI-Manager 的 cm-cli。
 
-This module deliberately does not alter the existing ComfyUI update service.
-Network checks, dependency planning, and mutating operations are added in later
-layers; ``scan_local`` only inspects direct children of ``custom_nodes``.
+为什么是 cm-cli 而不是 Manager 的 HTTP API：
+- HTTP API（/manager/queue/* 等）路由挂在 ComfyUI server 上，必须 ComfyUI 在跑。
+- cm-cli.py 用 ComfyUI 内置 python + COMFYUI_PATH 即可**独立运行**（import manager_core，
+  不 import manager_server），复用 Manager 全部能力：git 更新 + 每个插件的 pip 依赖
+  （PIPFixer）+ CNR registry + snapshot。
+
+调用形态：
+    [python_path, cm_cli_path, "update", "all"]
+    env: COMFYUI_PATH=<comfyui_dir>   # cm-cli.py:26 靠它定位 ComfyUI
+    cwd: ComfyUI-Manager 目录
+
+Phase 1：仅 update（update_all / update_selected）。
+后续（cm-cli 已支持，同一套 _run_cmcli 包装）：
+    simple-show（列已装，注意依赖 registry 数据，本地模式可能为空）/ install /
+    uninstall / enable / disable / fix / save-snapshot ...
 """
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from enum import Enum
 import os
-from pathlib import Path, PurePath
-import re
-import shutil
-import stat
-import subprocess
-from typing import Literal, Optional, Sequence, Tuple
-from urllib.parse import urlsplit, urlunsplit
-import uuid
+import concurrent.futures
+from pathlib import Path
+from typing import Any, Optional
 
+from utils import paths as PATHS
 from utils.common import run_hidden
 
 
-class PluginState(str, Enum):
-    LOCAL_ONLY = "local_only"
-    UP_TO_DATE = "up_to_date"
-    UPDATE_AVAILABLE = "update_available"
-    LOCAL_CHANGES = "local_changes"
-    LOCAL_AHEAD = "local_ahead"
-    DIVERGED = "diverged"
-    DETACHED_HEAD = "detached_head"
-    NO_UPSTREAM = "no_upstream"
-    NO_REMOTE = "no_remote"
-    NON_GIT = "non_git"
-    UNBORN_HEAD = "unborn_head"
-    REPOSITORY_ERROR = "repository_error"
-    OUTSIDE_CUSTOM_NODES = "outside_custom_nodes"
-    NESTED_OR_EXTERNAL_REPO = "nested_or_external_repo"
-    SUBMODULES_UNSUPPORTED = "submodules_unsupported"
-    CHECK_FAILED = "check_failed"
-    UPDATE_FAILED = "update_failed"
-    REMOVED = "removed"
-    CANCELLED = "cancelled"
+def _parse_version(v: str) -> tuple:
+    """把语义版本字符串（如 '1.2.10'）转成可比较的元组 (1, 2, 10)。
+
+    非数字段当 0 处理；空串/nightly 等 → (-1,) 保证小于任何正式版。
+    用于 CNR 插件「本地版本 < registry 最新版」判断。
+    """
+    if not v:
+        return (-1,)
+    parts = []
+    for p in str(v).split("."):
+        try:
+            parts.append(int(p))
+        except (ValueError, TypeError):
+            parts.append(0)
+    return tuple(parts) if parts else (-1,)
+
+# cm-cli update 全量可能很久（N 个插件 git + pip）；给个宽松上限。
+_DEFAULT_TIMEOUT = 3600
+# 返回 log 截断长度（cm-cli 输出是人类文本，可能很长）。
+_LOG_LIMIT = 4000
 
 
-class UpdateAvailability(str, Enum):
-    UNKNOWN = "unknown"
-    CHECKING = "checking"
-    UP_TO_DATE = "up_to_date"
-    AVAILABLE = "available"
-    NOT_CHECKABLE = "not_checkable"
-    CHECK_FAILED = "check_failed"
-
-
-class DependencyState(str, Enum):
-    UNKNOWN = "unknown"
-    CHECKING = "checking"
-    NOT_CHANGED = "not_changed"
-    SATISFIED = "satisfied"
-    SAFE_TO_INSTALL = "safe_to_install"
-    COMPATIBLE_UPGRADE = "compatible_upgrade"
-    INCOMPATIBLE_CONSTRAINTS_BLOCKED = "incompatible_constraints_blocked"
-    DOWNGRADE_BLOCKED = "downgrade_blocked"
-    GLOBAL_INDEX_INCOMPLETE = "global_index_incomplete"
-    PROTECTED_PACKAGE_BLOCKED = "protected_package_blocked"
-    NON_STANDARD_SOURCE_BLOCKED = "non_standard_source_blocked"
-    SOURCE_BUILD_BLOCKED = "source_build_blocked"
-    CUSTOM_SCRIPT_BLOCKED = "custom_script_blocked"
-    PREFLIGHT_FAILED = "preflight_failed"
-    INSTALLING = "installing"
-    INSTALL_FAILED = "install_failed"
-    READY = "ready"
-
-
-@dataclass
-class PluginRecord:
-    name: str
-    path: Path
-    state: PluginState
-    update_availability: UpdateAvailability = UpdateAvailability.UNKNOWN
-    dependency_state: DependencyState = DependencyState.UNKNOWN
-    head: Optional[str] = None
-    branch: Optional[str] = None
-    upstream: Optional[str] = None
-    remote_name: Optional[str] = None
-    remote_url_display: Optional[str] = None
-    dirty_count: int = 0
-    untracked_count: int = 0
-    ahead: Optional[int] = None
-    behind: Optional[int] = None
-    checked_at: Optional[datetime] = None
-    check_generation: int = 0
-    target_head: Optional[str] = None
-    dependency_additions: Tuple[str, ...] = ()
-    dependency_changes: Tuple[str, ...] = ()
-    dependency_strict_constraints: Tuple[str, ...] = ()
-    dependency_conflicts: Tuple[str, ...] = ()
-    dependency_reason: str = ""
-    reason: str = ""
-    error_code: Optional[str] = None
-    can_check: bool = False
-    can_update: bool = False
-
-
-@dataclass(frozen=True)
-class DependencyPlan:
-    plugin_path: Path
-    target_head: str
-    state: DependencyState
-    requirements: Tuple[str, ...]
-    additions: Tuple[str, ...]
-    resolved_changes: Tuple[str, ...] = ()
-    protected_conflicts: Tuple[str, ...] = ()
-    strict_constraints: Tuple[str, ...] = ()
-    conflicting_plugins: Tuple[str, ...] = ()
-    conflicts: Tuple[str, ...] = ()
-    reason: str = ""
-
-
-@dataclass(frozen=True)
-class PluginInstallPreview:
-    source_url_display: str
-    staging_path: Path
-    target_path: Path
-    target_head: str
-    dependency_plan: DependencyPlan
-    expires_at: datetime
-
-
-@dataclass
-class PluginOperationResult:
-    plugin_name: str
-    operation: Literal["scan", "check", "update", "install", "uninstall"]
-    outcome: Literal["success", "skipped", "failed", "cancelled"]
-    state: PluginState
-    previous_head: Optional[str] = None
-    current_head: Optional[str] = None
-    dependencies_added: Tuple[str, ...] = ()
-    dependencies_changed: Tuple[str, ...] = ()
-    message: str = ""
-
-
-@dataclass(frozen=True)
-class PluginInstallTarget:
-    source_url: str
-    source_url_display: str
-    name: str
-    target_path: Path
-    staging_path: Path
+def _truncate(text: str, limit: int = _LOG_LIMIT) -> str:
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
 
 
 class PluginService:
-    """Discovers and classifies direct custom-node directories locally."""
-
-    _NON_REPOSITORY_MARKERS = (
-        "not a git repository",
-        "not a repository",
-    )
+    """把 ComfyUI-Manager 的 cm-cli 当 subprocess 调用。"""
 
     def __init__(self, app):
         self.app = app
-        self._dependency_service = None
-        self._install_previews = {}
-        self._active_processes = set()
 
-    def cancel_active_processes(self):
-        for process in tuple(self._active_processes):
-            try:
-                process.terminate()
-            except Exception:
-                pass
-        if self._dependency_service is not None:
-            self._dependency_service.cancel_active_processes()
+    # ---- 路径解析（全部复用 utils.paths，无新配置）----
+    def _comfyui_dir(self) -> Path:
+        # comfy_root_from_config 已自带 /ComfyUI，返回的就是 ComfyUI 代码目录
+        # （即 COMFYUI_PATH 应设的值，也是 custom_nodes 的父目录）。
+        return PATHS.comfy_root_from_config(getattr(self.app, "config", None))
 
-    def custom_nodes_root(self) -> Path:
+    def _python_exec(self) -> Optional[str]:
         try:
-            portable_root = Path(
-                self.app.config.get("paths", {}).get("comfyui_root") or "."
-            ).resolve()
+            # 多环境支持：读激活环境的 python_path
+            paths = self.app.get_active_paths() if hasattr(self.app, "get_active_paths") \
+                else (getattr(self.app, "config", None) or {}).get("paths", {})
+            py_cfg = (paths or {}).get("python_path") or "python_embeded/python.exe"
+            return str(PATHS.resolve_python_exec(self._comfyui_dir(), py_cfg))
         except Exception:
-            portable_root = Path(".").resolve()
-        return portable_root / "ComfyUI" / "custom_nodes"
+            return None
 
-    def scan_local(self) -> list[PluginRecord]:
-        """Return every direct plugin directory without making network calls."""
-        root = self.custom_nodes_root()
-        if not root.is_dir():
+    def _cm_cli_path(self) -> Optional[Path]:
+        try:
+            p = self._comfyui_dir() / "custom_nodes" / "ComfyUI-Manager" / "cm-cli.py"
+            return p if p.exists() else None
+        except Exception:
+            return None
+
+    def is_available(self) -> bool:
+        """ComfyUI-Manager 与 ComfyUI 内置 python 是否就绪。"""
+        cm = self._cm_cli_path()
+        py = self._python_exec()
+        return bool(cm) and bool(py) and Path(py).exists()
+
+    # ---- 逐插件枚举（per-plugin 粒度管理的基础）----
+    def list_installed(self) -> list[dict[str, Any]]:
+        """枚举 custom_nodes 下已装插件（直接文件系统探测，不依赖 server/registry）。
+
+        返回 [{name, dir_name, kind, enabled, version, remote_url, local_date}], 按名称排序。
+
+        字段说明：
+        - name:      展示用的纯插件名（已刻掉 .disabled 后缀）。
+        - dir_name:  custom_nodes 下的真实目录名（禁用插件带 .disabled 后缀）。
+                     git/cm-cli 等磁盘操作一律用这个，不用 name。
+        - enabled:   是否启用。ComfyUI-Manager 用给目录加 .disabled 后缀的方式禁用，
+                     这里据此判断（entry.name.endswith('.disabled')）。
+        - kind:      插件来源类型，三态（与 ComfyUI-Manager 对齐）：
+                       "git"  = 有 .git 目录（git clone 装的，可 git pull 更新）
+                       "cnr"  = 无 .git 但有 pyproject.toml（CNR registry 发布版，如 Manager 装的）
+                       "local"= 都没有（纯本地脚本，无法更新）
+                     （历史 is_git 字段保留 = (kind == "git")，向后兼容）
+        - version:   优先 pyproject.toml 的 version（如 "1.1.10"，人读友好）；
+                     无 pyproject 时回退 git commit 短哈希；都没有为空串。
+        - remote_url: git origin URL 或 pyproject 的 Repository URL；都没有为空串。
+        - local_date: git 插件的 HEAD commit 日期(YYYY-MM-DD)；非 git 为空串。
+                       （CNR 插件的版本走 version 字段，不靠日期。）
+
+        供 UI 逐个勾选更新 / 卸载 / 启用禁用 用。
+        """
+        cn_dir = PATHS.plugins_dir(self._comfyui_dir())
+        if not cn_dir.exists():
             return []
-
-        root_resolved = root.resolve()
-        records: list[PluginRecord] = []
-        try:
-            candidates = sorted(root.iterdir(), key=lambda item: item.name.casefold())
-        except OSError:
-            return []
-
-        for candidate in candidates:
-            if candidate.name == ".git" or candidate.name.startswith(".launcher-") or not candidate.is_dir():
+        # ---- 第一遍：纯文件系统探测（便宜，同步）----
+        # 先把每个插件的基本信息收齐（name/dir_name/kind/enabled + pyproject 的 version/remote_url），
+        # 记下哪些是 git 仓库需要第二遍跑 git 命令。结果按 dir_name 字典序（sorted iterdir 保证）。
+        results: list[dict[str, Any]] = []
+        pending_git: list[tuple[int, Path]] = []  # (results 下标, 插件目录) 第二遍并行处理
+        for entry in sorted(cn_dir.iterdir()):
+            if not entry.is_dir():
                 continue
-            records.append(self._scan_candidate(candidate, root_resolved))
-        return records
-
-    def validate_install_url(self, source_url: str) -> PluginInstallTarget:
-        value = (source_url or "").strip()
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
-            or not parsed.path.endswith(".git")
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("仅支持不含凭据的 HTTPS .git 仓库地址")
-        name = PurePath(parsed.path).name[:-4]
-        if not self._is_valid_plugin_name(name):
-            raise ValueError("仓库名称不能作为 Windows 目录名")
-        root = self.custom_nodes_root()
-        if not root.is_dir():
-            raise ValueError("未找到 custom_nodes 目录")
-        target_path = root / name
-        if target_path.exists():
-            raise ValueError(f"目标目录已存在：{target_path}")
-        staging_path = root / ".launcher-staging" / uuid.uuid4().hex
-        return PluginInstallTarget(value, self.sanitize_remote_url(value) or value, name, target_path, staging_path)
-
-    def clone_to_staging(self, target: PluginInstallTarget) -> PluginOperationResult:
-        if self._comfyui_is_running():
-            return PluginOperationResult(target.name, "install", "skipped", PluginState.CANCELLED, message="ComfyUI 正在运行")
-        if target.target_path.exists():
-            return PluginOperationResult(target.name, "install", "failed", PluginState.UPDATE_FAILED, message="目标目录已存在")
-        try:
-            target.staging_path.parent.mkdir(parents=True, exist_ok=True)
-            result = self._run_git_raw("clone", "--no-recurse-submodules", target.source_url, str(target.staging_path), timeout=120)
-            if result.returncode != 0:
-                self.cleanup_staging(target.staging_path)
-                return PluginOperationResult(target.name, "install", "failed", PluginState.UPDATE_FAILED, message=self._git_message(result))
-            return PluginOperationResult(target.name, "install", "success", PluginState.LOCAL_ONLY, message="已克隆到临时目录")
-        except OSError as exc:
-            self.cleanup_staging(target.staging_path)
-            return PluginOperationResult(target.name, "install", "failed", PluginState.UPDATE_FAILED, message=str(exc))
-
-    def prepare_install(self, source_url: str) -> PluginInstallPreview:
-        target = self.validate_install_url(source_url)
-        clone = self.clone_to_staging(target)
-        if clone.outcome != "success":
-            raise ValueError(clone.message)
-        candidate = self._scan_candidate(target.staging_path, target.staging_path.parent.resolve())
-        if candidate.state in {PluginState.SUBMODULES_UNSUPPORTED, PluginState.REPOSITORY_ERROR, PluginState.NON_GIT, PluginState.UNBORN_HEAD}:
-            self.cleanup_staging(target.staging_path)
-            raise ValueError(candidate.reason or "临时 clone 无法作为插件安装")
-        candidate.target_head = candidate.head
-        dependency = self._dependencies()
-        index = dependency.build_global_index(self.scan_local(), {candidate.path: candidate.head}, [candidate])
-        preflight = dependency.preflight_many(index, [candidate])
-        plan = preflight.plans[candidate.path.resolve()]
-        if plan.state not in {
-            DependencyState.NOT_CHANGED, DependencyState.SATISFIED,
-            DependencyState.SAFE_TO_INSTALL, DependencyState.COMPATIBLE_UPGRADE,
-        }:
-            dependency.cleanup(preflight)
-            self.cleanup_staging(target.staging_path)
-            raise ValueError(plan.reason or "插件依赖未通过预检")
-        preview = PluginInstallPreview(
-            target.source_url_display, target.staging_path, target.target_path,
-            candidate.head or "", plan, datetime.now() + timedelta(minutes=10),
-        )
-        self._install_previews[preview.staging_path.resolve()] = (target, candidate, preflight)
-        return preview
-
-    def install_from_preview(self, preview: PluginInstallPreview) -> PluginOperationResult:
-        key = preview.staging_path.resolve()
-        saved = self._install_previews.pop(key, None)
-        if saved is None or datetime.now() > preview.expires_at:
-            self.cleanup_staging(preview.staging_path)
-            return PluginOperationResult(preview.target_path.name, "install", "failed", PluginState.UPDATE_FAILED, message="安装预览已过期")
-        target, candidate, preflight = saved
-        dependency = self._dependencies()
-        try:
-            if self._comfyui_is_running() or preview.target_path.exists() or not preview.staging_path.is_dir():
-                return PluginOperationResult(preview.target_path.name, "install", "skipped", PluginState.CANCELLED, message="安装条件已变化")
-            head = self._run_git(preview.staging_path, "rev-parse", "HEAD")
-            if head.returncode != 0 or head.stdout.strip() != preview.target_head:
-                return PluginOperationResult(preview.target_path.name, "install", "failed", PluginState.UPDATE_FAILED, message="临时仓库提交已变化")
-            prepared = dependency.prepare_wheels(preflight)
-            if not hasattr(prepared, "forward_lock"):
-                return PluginOperationResult(preview.target_path.name, "install", "failed", PluginState.UPDATE_FAILED, message=prepared.message)
-            installed = dependency.install_prepared(prepared)
-            if not installed.success:
-                return PluginOperationResult(preview.target_path.name, "install", "failed", PluginState.UPDATE_FAILED, message=installed.message)
-            try:
-                preview.staging_path.rename(preview.target_path)
-            except OSError as exc:
-                dependency.rollback(prepared)
-                return PluginOperationResult(preview.target_path.name, "install", "failed", PluginState.UPDATE_FAILED, message=f"插件目录落位失败：{exc}")
-            return PluginOperationResult(preview.target_path.name, "install", "success", PluginState.UP_TO_DATE, None, preview.target_head, installed.additions, installed.changes, "插件与依赖已安装")
-        finally:
-            dependency.cleanup(preflight)
-            if preview.staging_path.exists():
-                self.cleanup_staging(preview.staging_path)
-
-    def check_one(self, record: PluginRecord) -> PluginRecord:
-        """Fetch one configured upstream and classify its ahead/behind state."""
-        if not record.can_check or not record.remote_name:
-            return record
-        fetched = self._run_git(record.path, "fetch", "--prune", record.remote_name)
-        if fetched.returncode != 0:
-            record.state = PluginState.CHECK_FAILED
-            record.update_availability = UpdateAvailability.CHECK_FAILED
-            record.can_update = False
-            record.reason = self._git_message(fetched)
-            record.error_code = "FETCH_FAILED"
-            return record
-        refreshed = self._scan_candidate(record.path, self.custom_nodes_root().resolve())
-        if not refreshed.can_check or not refreshed.upstream:
-            return refreshed
-        counts = self._run_git(refreshed.path, "rev-list", "--left-right", "--count", f"HEAD...{refreshed.upstream}")
-        try:
-            ahead, behind = (int(value) for value in counts.stdout.split())
-            if counts.returncode != 0 or ahead < 0 or behind < 0:
-                raise ValueError
-        except ValueError:
-            refreshed.state = PluginState.CHECK_FAILED
-            refreshed.update_availability = UpdateAvailability.CHECK_FAILED
-            refreshed.reason = "无法解析 Git ahead/behind 状态"
-            refreshed.error_code = "REV_LIST_INVALID"
-            return refreshed
-        refreshed.ahead, refreshed.behind = ahead, behind
-        refreshed.checked_at = datetime.now()
-        if behind:
-            refreshed.update_availability = UpdateAvailability.AVAILABLE
-        else:
-            refreshed.update_availability = UpdateAvailability.UP_TO_DATE
-        if ahead and behind:
-            refreshed.state = PluginState.DIVERGED
-        elif ahead:
-            refreshed.state = PluginState.LOCAL_AHEAD
-        elif behind:
-            target = self._run_git(refreshed.path, "rev-parse", refreshed.upstream)
-            if target.returncode != 0:
-                refreshed.state = PluginState.CHECK_FAILED
-                refreshed.update_availability = UpdateAvailability.CHECK_FAILED
-                refreshed.reason = self._git_message(target)
-                return refreshed
-            refreshed.state = PluginState.UPDATE_AVAILABLE
-            refreshed.target_head = target.stdout.strip()
-        else:
-            refreshed.state = PluginState.UP_TO_DATE
-        refreshed.can_check = True
-        refreshed.can_update = False
-        return refreshed
-
-    def refresh_all(self) -> list[PluginRecord]:
-        records = [self.check_one(record) if record.can_check else record for record in self.scan_local()]
-        candidates = [record for record in records if record.state == PluginState.UPDATE_AVAILABLE and record.target_head]
-        if not candidates:
-            return records
-        dependency = self._dependencies()
-        index = dependency.build_global_index(records, {record.path: record.target_head for record in candidates})
-        preflight = dependency.preflight_many(index, candidates)
-        for record in candidates:
-            plan = preflight.plans.get(record.path.resolve())
-            if plan is None:
+            dir_name = entry.name
+            if dir_name.startswith("__") or dir_name.startswith("."):
                 continue
-            self._apply_dependency_plan(record, plan)
-        dependency.cleanup(preflight)
-        return records
+            # ComfyUI-Manager 禁用插件 = 给目录加 .disabled 后缀
+            enabled = not dir_name.endswith(".disabled")
+            name = dir_name[:-len(".disabled")] if not enabled else dir_name
 
-    def update_one(self, record: PluginRecord) -> PluginOperationResult:
-        return self.update_many([record])[0]
+            has_git = (entry / ".git").exists()
+            py = self._read_pyproject(entry)
+            # 三态分类：.git 优先 git；否则有 pyproject 是 cnr；都没有 local
+            if has_git:
+                kind = "git"
+            elif py:
+                kind = "cnr"
+            else:
+                kind = "local"
 
-    def update_many(self, records: Sequence[PluginRecord]) -> list[PluginOperationResult]:
-        eligible = [record for record in records if record.can_update and record.target_head]
-        results = [
-            PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message="未通过更新预检")
-            for record in records if record not in eligible
-        ]
-        if self._comfyui_is_running():
-            return results + [
-                PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message="ComfyUI 正在运行")
-                for record in eligible
-            ]
-        if not eligible:
-            return results
-        dependency = self._dependencies()
-        all_records = self.scan_local()
-        index = dependency.build_global_index(all_records, {record.path: record.target_head for record in eligible})
-        preflight = dependency.preflight_many(index, eligible)
-        safe = [
-            record for record in eligible
-            if preflight.plans[record.path.resolve()].state in {
-                DependencyState.NOT_CHANGED, DependencyState.SATISFIED,
-                DependencyState.SAFE_TO_INSTALL, DependencyState.COMPATIBLE_UPGRADE,
+            rec: dict[str, Any] = {
+                "name": name,
+                "dir_name": dir_name,
+                "kind": kind,
+                "is_git": kind == "git",  # 向后兼容（outdated_plugins 等仍用它判断能否 git 操作）
+                "enabled": enabled,
+                "version": "",
+                "remote_url": "",
+                "local_date": "",
             }
-        ]
-        if len(safe) != len(eligible):
-            for record in eligible:
-                plan = preflight.plans[record.path.resolve()]
-                if record not in safe:
-                    self._apply_dependency_plan(record, plan)
-                    results.append(PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message=plan.reason))
-            # A conflicting candidate must not keep safe candidates blocked by
-            # its constraints. Re-resolve exactly the remaining batch.
-            dependency.cleanup(preflight)
-            index = dependency.build_global_index(all_records, {record.path: record.target_head for record in safe})
-            preflight = dependency.preflight_many(index, safe)
-            final_safe = [
-                record for record in safe
-                if preflight.plans[record.path.resolve()].state in {
-                    DependencyState.NOT_CHANGED, DependencyState.SATISFIED,
-                    DependencyState.SAFE_TO_INSTALL, DependencyState.COMPATIBLE_UPGRADE,
-                }
-            ]
-            for record in safe:
-                if record not in final_safe:
-                    plan = preflight.plans[record.path.resolve()]
-                    self._apply_dependency_plan(record, plan)
-                    results.append(PluginOperationResult(record.name, "update", "skipped", record.state, record.head, record.head, message=plan.reason))
-            safe = final_safe
-        if not safe:
-            dependency.cleanup(preflight)
-            return results
-        prepared = dependency.prepare_wheels(preflight)
-        if not hasattr(prepared, "forward_lock"):
-            dependency.cleanup(preflight)
-            return results + [PluginOperationResult(record.name, "update", "failed", PluginState.UPDATE_FAILED, record.head, record.head, message=prepared.message) for record in safe]
-        installed = dependency.install_prepared(prepared)
-        if not installed.success:
-            dependency.cleanup(preflight)
-            return results + [PluginOperationResult(record.name, "update", "failed", PluginState.UPDATE_FAILED, record.head, record.head, message=installed.message) for record in safe]
-        for record in safe:
-            old_head = record.head
-            merge = self._run_git(record.path, "merge", "--ff-only", record.target_head)
-            if merge.returncode != 0:
-                record.state = PluginState.UPDATE_FAILED
-                record.reason = self._git_message(merge)
-                results.append(PluginOperationResult(record.name, "update", "failed", record.state, old_head, old_head, message=record.reason))
-                continue
-            record.head = record.target_head
-            record.state = PluginState.UP_TO_DATE
-            record.update_availability = UpdateAvailability.UP_TO_DATE
-            record.can_update = False
-            results.append(PluginOperationResult(record.name, "update", "success", record.state, old_head, record.head, installed.additions, installed.changes, "插件与依赖已更新"))
-        dependency.cleanup(preflight)
+            # version/remote_url：优先 pyproject（CNR 和多数 git 插件都有），git 命令仅补缺失项
+            if py:
+                rec["version"] = py.get("version", "")
+                rec["remote_url"] = py.get("repository", "")
+            results.append(rec)
+            if has_git:
+                pending_git.append((len(results) - 1, entry))
+
+        # ---- 第二遍：git 信息并行回填（贵：每个仓库最多 3 条 git 命令）----
+        # 串行时 N 个仓库 ≈ N×3×0.5s；并行（4 worker）可压到约 1/4。失败回退串行，保契约不破。
+        self._fill_git_info(results, pending_git)
         return results
 
-    def uninstall_one(self, record: PluginRecord) -> PluginOperationResult:
-        if self._comfyui_is_running():
-            return PluginOperationResult(record.name, "uninstall", "skipped", record.state, message="ComfyUI 正在运行")
+    def _fill_git_info(
+        self, results: list[dict[str, Any]], pending_git: list[tuple[int, Path]]
+    ) -> None:
+        """对 pending_git 里的每个 git 仓库并行跑 rev-parse/remote/log，回填到 results。
+
+        线程池并行（max_workers=4，与 core/version_service 同款）。任一仓库的 git 调用
+        失败只影响该仓库（_git_out 返回空串，不抛）。线程池整体异常则回退串行保底。
+        线程安全：每个 task 只写 results 自己的下标，无共享写。
+        """
+        if not pending_git:
+            return
+
+        def _one(item: tuple[int, Path]) -> tuple[int, str, str, str]:
+            idx, d = item
+            return idx, self._git_short(d), self._git_remote(d), self._git_date(d)
+
         try:
-            path = self._validated_direct_plugin_path(record.path)
-        except ValueError as exc:
-            return PluginOperationResult(record.name, "uninstall", "failed", record.state, message=str(exc))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                for idx, ver, rem, date in ex.map(_one, pending_git):
+                    rec = results[idx]
+                    if not rec["version"]:
+                        rec["version"] = ver
+                    if not rec["remote_url"]:
+                        rec["remote_url"] = rem
+                    rec["local_date"] = date
+        except Exception:
+            # 并行调度整体失败（极罕见）→ 回退串行，保证返回结构完整
+            for idx, d in pending_git:
+                rec = results[idx]
+                if not rec["version"]:
+                    rec["version"] = self._git_short(d)
+                if not rec["remote_url"]:
+                    rec["remote_url"] = self._git_remote(d)
+                rec["local_date"] = self._git_date(d)
+
+    def _read_pyproject(self, plugin_dir: Path) -> dict[str, str]:
+        """读插件根目录的 pyproject.toml，取 version 和 project.urls.Repository。
+
+        CNR 插件和多数现代 git 插件都有 pyproject.toml，是版本信息最可靠的来源
+        （比 git commit 哈希更直观）。失败/不存在返回空 dict，不抛。
+        用 tomllib（3.11+）解析，失败回退正则（兼容嵌入式 python 或格式异常）。
+        """
+        pp = plugin_dir / "pyproject.toml"
+        if not pp.exists():
+            return {}
         try:
-            shutil.rmtree(path)
-        except OSError as exc:
-            return PluginOperationResult(record.name, "uninstall", "failed", record.state, message=f"插件目录未完全删除：{exc}")
-        return PluginOperationResult(record.name, "uninstall", "success", PluginState.REMOVED, message="插件目录已删除")
-
-    @staticmethod
-    def cleanup_staging(staging_path: Path) -> None:
-        shutil.rmtree(staging_path, ignore_errors=True)
-
-    def _scan_candidate(self, candidate: Path, root_resolved: Path) -> PluginRecord:
+            raw = pp.read_text(encoding="utf-8")
+        except Exception:
+            return {}
+        # 优先 tomllib（标准库，3.11+）
         try:
-            candidate_resolved = candidate.resolve()
-        except OSError as exc:
-            return self._record(
-                candidate,
-                PluginState.REPOSITORY_ERROR,
-                reason="无法解析插件目录",
-                error_code="PATH_RESOLVE_FAILED",
-                detail=str(exc),
-            )
+            import tomllib
+            data = tomllib.loads(raw)
+            proj = data.get("project", {}) or {}
+            result = {"version": str(proj.get("version", "") or "")}
+            urls = proj.get("urls", {}) or {}
+            result["repository"] = str(urls.get("Repository", "") or urls.get("Homepage", "") or "")
+            return result
+        except Exception:
+            pass
+        # 回退：正则取 version 和 Repository（行内 key = "value"）
+        import re
+        ver = ""
+        repo = ""
+        m = re.search(r'^\s*version\s*=\s*"([^"]*)"', raw, re.MULTILINE)
+        if m:
+            ver = m.group(1)
+        m = re.search(r'Repository\s*=\s*"([^"]*)"', raw)
+        if m:
+            repo = m.group(1)
+        out = {}
+        if ver:
+            out["version"] = ver
+        if repo:
+            out["repository"] = repo
+        return out
 
-        if candidate_resolved.parent != root_resolved:
-            return self._record(
-                candidate,
-                PluginState.OUTSIDE_CUSTOM_NODES,
-                reason="插件目录不在 custom_nodes 的直接子目录内",
-                error_code="OUTSIDE_ROOT",
-            )
 
-        inside = self._run_git(candidate_resolved, "rev-parse", "--is-inside-work-tree")
-        if inside.returncode != 0 or inside.stdout.strip().lower() != "true":
-            if self._is_non_repository(inside):
-                return self._record(candidate_resolved, PluginState.NON_GIT)
-            return self._git_error(candidate_resolved, inside, "NOT_A_WORKTREE")
+    def _git_exec(self) -> str:
+        return getattr(self.app, "git_path", None) or "git"
 
-        top_level = self._run_git(candidate_resolved, "rev-parse", "--show-toplevel")
-        if top_level.returncode != 0:
-            return self._git_error(candidate_resolved, top_level, "TOPLEVEL_READ_FAILED")
+    def _git_short(self, plugin_dir: Path) -> str:
+        return self._git_out(["rev-parse", "--short", "HEAD"], plugin_dir)
+
+    def _git_remote(self, plugin_dir: Path) -> str:
+        return self._git_out(["remote", "get-url", "origin"], plugin_dir)
+
+    def _git_date(self, plugin_dir: Path) -> str:
+        """HEAD commit 的提交日期，紧凑 YYYY-MM-DD（git log -1 --format=%cs）。
+
+        本地操作无网络开销；供 UI 版本列展示「本地日期」用。
+        """
+        return self._git_out(["log", "-1", "--format=%cs"], plugin_dir)
+
+    def _git_out(self, args: list[str], cwd: Path) -> str:
+        """跑一条 git 命令，成功返回 strip 后的 stdout，否则空串。"""
         try:
-            if Path(top_level.stdout.strip()).resolve() != candidate_resolved:
-                return self._record(
-                    candidate_resolved,
-                    PluginState.NESTED_OR_EXTERNAL_REPO,
-                    reason="Git 工作树顶层不是插件目录",
-                    error_code="TOPLEVEL_MISMATCH",
-                )
-        except OSError:
-            return self._record(
-                candidate_resolved,
-                PluginState.NESTED_OR_EXTERNAL_REPO,
-                reason="无法验证 Git 工作树顶层",
-                error_code="TOPLEVEL_MISMATCH",
-            )
+            r = run_hidden([self._git_exec(), *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return (r.stdout or "").strip()
+        except Exception:
+            pass
+        return ""
 
-        return self._scan_git_repository(candidate_resolved)
+    def _git_run(self, args: list[str], cwd: Path, timeout: int = 120) -> dict[str, Any]:
+        """跑一条 git 命令，返回 {rc, stdout, stderr}（保留退出码，供强制更新判断）。"""
+        try:
+            r = run_hidden([self._git_exec(), *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=timeout)
+            return {"rc": r.returncode, "stdout": r.stdout or "", "stderr": r.stderr or ""}
+        except Exception as e:
+            return {"rc": -1, "stdout": "", "stderr": str(e)}
 
-    def _scan_git_repository(self, path: Path) -> PluginRecord:
-        status = self._run_git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-        if status.returncode != 0:
-            return self._git_error(path, status, "STATUS_FAILED")
-        dirty_count, untracked_count = self._status_counts(status.stdout)
+    def _cnr_registry_map(self) -> dict[str, str]:
+        """读 ComfyUI-Manager 的 CNR registry 缓存，建 {repo_url: latest_version} 映射。
 
-        head_result = self._run_git(path, "rev-parse", "--verify", "HEAD")
-        if head_result.returncode != 0:
-            return self._record(
-                path,
-                PluginState.UNBORN_HEAD,
-                dirty_count=dirty_count,
-                untracked_count=untracked_count,
-                reason="仓库尚无首个提交",
-                error_code="UNBORN_HEAD",
-            )
-        head = head_result.stdout.strip()
+        缓存文件：<comfyui>/user/__manager/cache/<hash>_nodes.json（hash 不固定，glob 找）。
+        Manager 用它判断 CNR 插件是否有新版（本地 pyproject version < registry latest_version）。
+        缓存不存在/解析失败返回空 dict，不抛（CNR 插件查不出更新，优雅降级）。
 
-        if self._has_submodules(path):
-            return self._record(
-                path,
-                PluginState.SUBMODULES_UNSUPPORTED,
-                head=head,
-                dirty_count=dirty_count,
-                untracked_count=untracked_count,
-                reason="插件包含 Git submodule",
-                error_code="SUBMODULES_UNSUPPORTED",
-            )
+        匹配方式与 Manager 一致：用 repository URL 反查（本地 pyproject.Repository ↔ registry.repository）。
+        """
+        try:
+            cache_dir = self._comfyui_dir() / "user" / "__manager" / "cache"
+            if not cache_dir.exists():
+                return {}
+            # nodes.json 文件名带 hash，glob 找最新的
+            candidates = sorted(cache_dir.glob("*_nodes.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not candidates:
+                return {}
+            import json
+            data = json.loads(candidates[0].read_text(encoding="utf-8"))
+            nodes = data.get("nodes", []) if isinstance(data, dict) else []
+            mapping = {}
+            for n in nodes:
+                if not isinstance(n, dict):
+                    continue
+                repo = n.get("repository") or ""
+                lv = n.get("latest_version")
+                ver = ""
+                if isinstance(lv, dict):
+                    ver = str(lv.get("version", "") or "")
+                if repo and ver:
+                    mapping[repo.rstrip("/")] = ver
+            return mapping
+        except Exception:
+            return {}
 
-        branch_result = self._run_git(path, "branch", "--show-current")
-        if branch_result.returncode != 0:
-            return self._git_error(path, branch_result, "BRANCH_READ_FAILED", head=head)
-        branch = branch_result.stdout.strip() or None
+    def outdated_plugins(self, names: list[str], on_progress=None) -> list[str]:
+        """返回 names 中「有可用更新」的子集，支持 git 和 CNR 两类插件。
 
-        remotes_result = self._run_git(path, "remote")
-        if remotes_result.returncode != 0:
-            return self._git_error(path, remotes_result, "REMOTE_READ_FAILED", head=head, branch=branch)
-        remotes = tuple(item.strip() for item in remotes_result.stdout.splitlines() if item.strip())
+        - git 插件：本地 HEAD != origin HEAD（git ls-remote 比对）。dirty 树/无网则不当落后。
+        - CNR 插件：本地 pyproject version < registry latest_version（语义版本比较）。
+          registry 缓存读不到则跳过（无法判断，不当落后）。
+        local 插件：无更新源，跳过。
 
-        upstream = None
-        remote_name = None
-        remote_url_display = None
-        if branch:
-            upstream_result = self._run_git(
-                path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
-            )
-            if upstream_result.returncode == 0:
-                upstream = upstream_result.stdout.strip() or None
-                if upstream and "/" in upstream:
-                    remote_name = upstream.split("/", 1)[0]
-        if remote_name is None and "origin" in remotes:
-            remote_name = "origin"
+        正常更新后仍落后 = 该插件没被更新成功（如 dirty 树被 cm-cli 拒），
+        也可作为「更新选中」后的失败检测。
 
-        if remote_name:
-            url_result = self._run_git(path, "remote", "get-url", remote_name)
-            if url_result.returncode == 0:
-                remote_url_display = self.sanitize_remote_url(url_result.stdout.strip())
-
-        common = {
-            "head": head,
-            "branch": branch,
-            "upstream": upstream,
-            "remote_name": remote_name,
-            "remote_url_display": remote_url_display,
-            "dirty_count": dirty_count,
-            "untracked_count": untracked_count,
-        }
-        if dirty_count or untracked_count:
-            return self._record(
-                path,
-                PluginState.LOCAL_CHANGES,
-                reason="检测到本地修改，自动更新已禁用",
-                error_code="DIRTY_WORKTREE",
-                can_check=bool(upstream and remote_name),
-                **common,
-            )
-        if not branch:
-            return self._record(
-                path,
-                PluginState.DETACHED_HEAD,
-                reason="插件处于 detached HEAD 状态",
-                error_code="DETACHED_HEAD",
-                **common,
-            )
-        if not remotes:
-            return self._record(
-                path,
-                PluginState.NO_REMOTE,
-                reason="当前仓库没有远程仓库",
-                error_code="NO_REMOTE",
-                **common,
-            )
-        if not upstream or not remote_name:
-            return self._record(
-                path,
-                PluginState.NO_UPSTREAM,
-                reason="当前分支没有远程跟踪分支",
-                error_code="NO_UPSTREAM",
-                **common,
-            )
-        return self._record(path, PluginState.LOCAL_ONLY, can_check=True, **common)
-
-    def _has_submodules(self, path: Path) -> bool:
-        gitmodules = self._run_git(path, "cat-file", "-e", "HEAD:.gitmodules")
-        if gitmodules.returncode == 0:
-            return True
-        status = self._run_git(path, "submodule", "status", "--recursive")
-        return status.returncode == 0 and bool(status.stdout.strip())
-
-    def _run_git(self, path: Path, *args: str) -> subprocess.CompletedProcess:
-        git_path = getattr(self.app, "git_path", None)
-        if not git_path:
-            services = getattr(self.app, "services", None)
-            git_service = getattr(services, "git", None) if services is not None else None
-            if git_service is not None:
+        on_progress(current, total, name)：每查完一个插件调一次，供 UI 显示
+        逐插件进度（如「正在查询第 3/60 个...」）。None 则不回调。
+        """
+        result = []
+        cn_dir = PATHS.plugins_dir(self._comfyui_dir())
+        total = len(names)
+        # CNR 检测依赖 registry 缓存，按需加载一次（git 检测不需要）
+        cnr_map = None  # 懒加载
+        installed = None  # list_installed 结果（CNR 需要 version/remote_url），懒加载
+        for i, name in enumerate(names):
+            if on_progress:
                 try:
-                    git_path, _ = git_service.resolve_git()
-                except Exception:
-                    git_path = None
-        git_path = git_path or "git"
-        command = [str(git_path), "-C", str(path), *args]
-        result = self._execute_git(command, 60 if args and args[0] == "fetch" else 10)
-        if result.returncode != 0 and "dubious ownership" in (result.stderr or "").lower():
-            services = getattr(self.app, "services", None)
-            git_service = getattr(services, "git", None) if services is not None else None
-            if git_service is not None:
-                try:
-                    git_service.fix_unsafe_repo(str(path))
-                    result = run_hidden(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=10,
-                    )
+                    on_progress(i, total, name)
                 except Exception:
                     pass
+            d = cn_dir / name
+            has_git = (d / ".git").exists()
+            if has_git:
+                # git 插件：ls-remote 比对
+                local = self._git_out(["rev-parse", "HEAD"], d)
+                remote = self._git_remote_head(d)
+                if remote and local and remote != local:
+                    result.append(name)
+                continue
+            # 非 git：可能是 CNR 插件（有 pyproject.toml），用 registry 版本比较
+            py = self._read_pyproject(d)
+            if not py or not py.get("version"):
+                continue  # local 插件无更新源
+            if cnr_map is None:
+                cnr_map = self._cnr_registry_map()
+            if not cnr_map:
+                continue  # registry 缓存不可用，无法判断
+            repo_url = (py.get("repository") or "").rstrip("/")
+            latest = cnr_map.get(repo_url)
+            if latest and _parse_version(latest) > _parse_version(py["version"]):
+                result.append(name)
+        if on_progress:
+            try:
+                on_progress(total, total, "")
+            except Exception:
+                pass
         return result
 
-    def _execute_git(self, command, timeout):
-        try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-            self._active_processes.add(process)
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                stdout, stderr = process.communicate()
-                return subprocess.CompletedProcess(command, 1, stdout, stderr or "Git 命令超时")
-            finally:
-                self._active_processes.discard(process)
-        except Exception as exc:
-            return subprocess.CompletedProcess(command, 1, "", str(exc))
+    def _git_remote_head(self, plugin_dir: Path) -> str:
+        """git ls-remote origin HEAD → 远端 HEAD sha（取不到返回空串）。"""
+        out = self._git_out(["ls-remote", "origin", "HEAD"], plugin_dir)
+        parts = out.split()
+        return parts[0] if parts else ""
 
-    def _run_git_raw(self, *args: str, timeout: int) -> subprocess.CompletedProcess:
-        git_path = getattr(self.app, "git_path", None) or "git"
-        return run_hidden(
-            [str(git_path), *args], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
-        )
+    def remote_dates(self, names: list[str]) -> dict[str, str]:
+        """取这些插件远端 HEAD 的 commit 日期，{dir_name: "YYYY-MM-DD"}。
 
-    def _dependencies(self):
-        if self._dependency_service is None:
-            from services.plugin_dependency_service import PluginDependencyService
-            self._dependency_service = PluginDependencyService(self.app)
-        return self._dependency_service
-
-    @staticmethod
-    def _apply_dependency_plan(record: PluginRecord, plan: DependencyPlan) -> None:
-        record.dependency_state = plan.state
-        record.dependency_additions = plan.additions
-        record.dependency_changes = plan.resolved_changes
-        record.dependency_strict_constraints = plan.strict_constraints
-        record.dependency_conflicts = plan.conflicts
-        record.dependency_reason = plan.reason
-        record.can_update = plan.state in {
-            DependencyState.NOT_CHANGED, DependencyState.SATISFIED,
-            DependencyState.SAFE_TO_INSTALL, DependencyState.COMPATIBLE_UPGRADE,
-        }
-
-    def _validated_direct_plugin_path(self, candidate: Path) -> Path:
-        root = self.custom_nodes_root().resolve()
-        raw = Path(candidate)
-        if not raw.exists() or not raw.is_dir() or raw.is_symlink() or self._is_reparse_point(raw):
-            raise ValueError("插件目录无效或是链接目录")
-        resolved = raw.resolve()
-        if resolved.parent != root:
-            raise ValueError("只能删除 custom_nodes 的直接子目录")
-        return resolved
-
-    def _comfyui_is_running(self) -> bool:
-        checker = getattr(self.app, "_is_comfyui_running", None)
-        if callable(checker):
-            try:
-                return bool(checker())
-            except Exception:
-                return True
-        return False
-
-    @staticmethod
-    def _is_valid_plugin_name(name: str) -> bool:
-        reserved = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
-        return bool(name and name not in {".", ".."} and name.casefold() not in reserved and not re.search(r'[<>:"/\\|?*]', name) and not name.endswith((".", " ")))
-
-    @staticmethod
-    def _is_reparse_point(path: Path) -> bool:
-        attributes = getattr(os.stat(path, follow_symlinks=False), "st_file_attributes", 0)
-        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-
-    @staticmethod
-    def _git_message(result: subprocess.CompletedProcess) -> str:
-        return ((result.stderr or result.stdout or "Git 操作失败").strip())[:500]
-
-    @staticmethod
-    def sanitize_remote_url(remote_url: str) -> Optional[str]:
-        value = (remote_url or "").strip()
-        if not value:
-            return None
-        if "://" in value:
-            parsed = urlsplit(value)
-            host = parsed.hostname or ""
-            if parsed.port:
-                host = f"{host}:{parsed.port}"
-            return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
-        if "@" in value and ":" in value:
-            return value.split("@", 1)[1]
-        return value
-
-    @staticmethod
-    def _status_counts(output: str) -> tuple[int, int]:
-        dirty_count = 0
-        untracked_count = 0
-        for entry in (output or "").split("\0"):
-            if not entry:
+        用 git log -1 --format=%cs origin/HEAD —— 依赖本地已 fetch 过 origin/HEAD ref
+        （ComfyUI 插件通常都有）。取不到（未 fetch / 无网）的插件不进结果 dict，
+        delegate 对缺失项不画远端日期列。仅对 outdated 插件调用，控制网络/IO 成本。
+        """
+        cn_dir = PATHS.plugins_dir(self._comfyui_dir())
+        result: dict[str, str] = {}
+        cnr_map = None
+        for name in names:
+            d = cn_dir / name
+            if (d / ".git").exists():
+                # git 插件：远端 commit 日期
+                date = self._git_out(["log", "-1", "--format=%cs", "origin/HEAD"], d)
+                if date:
+                    result[name] = date
                 continue
-            if entry.startswith("??"):
-                untracked_count += 1
-            else:
-                dirty_count += 1
-        return dirty_count, untracked_count
+            # CNR 插件：远端 = registry 最新版本号（如 "1.2.0"）
+            py = self._read_pyproject(d)
+            if not py.get("repository"):
+                continue
+            if cnr_map is None:
+                cnr_map = self._cnr_registry_map()
+            latest = cnr_map.get((py["repository"]).rstrip("/"))
+            if latest:
+                result[name] = latest
+        return result
 
-    def _git_error(self, path: Path, result: subprocess.CompletedProcess, error_code: str, **fields) -> PluginRecord:
-        detail = (result.stderr or result.stdout or "Git 命令失败").strip()
-        return self._record(
-            path,
-            PluginState.REPOSITORY_ERROR,
-            reason="无法读取 Git 仓库状态",
-            error_code=error_code,
-            detail=detail,
-            **fields,
-        )
+    def check_updates(self, on_progress=None) -> list[str]:
+        """检查全部已装插件是否有更新（批量 git ls-remote 比对）。
 
-    @classmethod
-    def _is_non_repository(cls, result: subprocess.CompletedProcess) -> bool:
-        text = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        return any(marker in text for marker in cls._NON_REPOSITORY_MARKERS)
+        复用 outdated_plugins：把 list_installed() 的 dir_name 全传过去，
+        返回落后于 origin 的 dir_name 子集。供 UI「检查更新」按钮和
+        CLI `plugins check-updates` 共用，避免两处重复拼 names。
+        ls-remote 取不到（无网）的插件不当成落后，离线友好。
 
-    @staticmethod
-    def _record(path: Path, state: PluginState, detail: str = "", **fields) -> PluginRecord:
-        reason = fields.pop("reason", "")
-        if detail:
-            reason = f"{reason}：{detail}" if reason else detail
-        return PluginRecord(name=path.name, path=path, state=state, reason=reason, **fields)
+        on_progress(current, total, name)：透传给 outdated_plugins，供 UI 逐插件进度。
+        """
+        names = [p["dir_name"] for p in self.list_installed()]
+        return self.outdated_plugins(names, on_progress=on_progress)
+
+    # ---- 通用 cm-cli 执行器 ----
+    def _run_cmcli(self, args: list[str], timeout: int = _DEFAULT_TIMEOUT) -> dict[str, Any]:
+        """跑一个 cm-cli 子命令。返回 {returncode, stdout, stderr, error}。"""
+        py = self._python_exec()
+        cm = self._cm_cli_path()
+        if not py or not cm or not Path(py).exists():
+            return {"returncode": -1, "stdout": "", "stderr": "",
+                    "error": "ComfyUI-Manager 或 ComfyUI 内置 python 未找到"}
+        cmd = [py, str(cm), *args]
+        env = os.environ.copy()
+        env["COMFYUI_PATH"] = str(self._comfyui_dir())
+        try:
+            r = run_hidden(
+                cmd,
+                env=env,
+                cwd=str(cm.parent),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return {"returncode": r.returncode, "stdout": r.stdout or "",
+                    "stderr": r.stderr or "", "error": None}
+        except Exception as e:
+            return {"returncode": -1, "stdout": "", "stderr": "", "error": str(e)}
+
+    # ---- 更新操作 ----
+    def update_all(self) -> dict[str, Any]:
+        """更新全部插件（cm-cli update all，含 pip 依赖修复）。
+
+        返回契约（对齐 services.update_service）：{updated, up_to_date, log, error}
+        """
+        return self._do_update(["all"])
+
+    def update_selected(self, nodes: list[str]) -> dict[str, Any]:
+        """更新指定插件（cm-cli update <node>...）。"""
+        if not nodes:
+            return {"updated": False, "up_to_date": False, "log": "",
+                    "error": "未指定要更新的插件"}
+        return self._do_update([str(n) for n in nodes])
+
+    def uninstall(self, target):
+        """卸载插件（cm-cli uninstall）。"""
+        return self._lifecycle("uninstall", target)
+
+    def disable(self, target):
+        """禁用插件（cm-cli disable）。"""
+        return self._lifecycle("disable", target)
+
+    def enable(self, target):
+        """启用插件（cm-cli enable）。"""
+        return self._lifecycle("enable", target)
+
+    def install(self, node_spec):
+        """安装插件（cm-cli install <CNR id | git url>）。"""
+        return self._lifecycle("install", node_spec)
+
+    def _lifecycle(self, op: str, target) -> dict[str, Any]:
+        """uninstall/disable/enable/install 共用：跑 cm-cli <op> <target>。"""
+        res = self._run_cmcli([op, str(target)])
+        if res["error"]:
+            return {"ok": False, "log": "", "error": res["error"]}
+        log = _truncate((res["stdout"] or res["stderr"]).strip())
+        rc = res["returncode"]
+        return {"ok": rc == 0, "log": log,
+                "error": None if rc == 0 else f"cm-cli {op} 退出码 {rc}"}
+
+    def force_update_selected(self, names: list[str]) -> list[dict[str, Any]]:
+        """强制更新选中的插件：确认是 git 仓库则 git stash + git pull --ff-only。
+
+        绕过 cm-cli（dirty 树会被它拒），直接对每个 git 插件 stash 本地改动后强拉。
+        返回每插件结果 [{name, ok, skipped, detail}]。
+        """
+        return [self._force_update_one(str(n)) for n in names]
+
+    def _force_update_one(self, name: str) -> dict[str, Any]:
+        cn_dir = PATHS.plugins_dir(self._comfyui_dir())
+        plugin_dir = cn_dir / name
+        if not plugin_dir.exists():
+            return {"name": name, "ok": False, "skipped": True, "detail": "目录不存在"}
+        if not (plugin_dir / ".git").exists():
+            return {"name": name, "ok": False, "skipped": True, "detail": "非 git 仓库，跳过强制更新"}
+        # 尽力 stash 本地改动（无改动也返回 0，忽略结果）
+        self._git_run(["stash"], plugin_dir)
+        pull = self._git_run(["pull", "--ff-only"], plugin_dir)
+        if pull["rc"] == 0:
+            detail = (pull["stdout"] or "已是最新").strip()
+            return {"name": name, "ok": True, "skipped": False, "detail": detail[:200]}
+        err = (pull["stderr"] or pull["stdout"] or "").strip()
+        return {"name": name, "ok": False, "skipped": False,
+                "detail": f"pull 失败 (rc={pull['rc']}): {err[:200]}"}
+
+    def _do_update(self, nodes: list[str]) -> dict[str, Any]:
+        if not self.is_available():
+            return {"updated": False, "up_to_date": False, "log": "",
+                    "error": "ComfyUI-Manager 未安装（在 custom_nodes/ComfyUI-Manager 找不到 cm-cli.py）"}
+        res = self._run_cmcli(["update", *nodes])
+        if res["error"]:
+            return {"updated": False, "up_to_date": False, "log": "", "error": res["error"]}
+        rc = res["returncode"]
+        out = (res["stdout"] or "").strip()
+        err = (res["stderr"] or "").strip()
+        log = _truncate(out if out else err)
+        if rc != 0:
+            return {"updated": False, "up_to_date": False, "log": log,
+                    "error": f"cm-cli update 退出码 {rc}"}
+        # cm-cli update 成功（rc=0）。其输出是人类文本，难以可靠区分「真更新了」与「本就最新」，
+        # 保守按「跑过更新流程」报 updated=True；细节见 log。
+        return {"updated": True, "up_to_date": False, "log": log, "error": None}

@@ -16,7 +16,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from services.plugin_service import DependencyPlan, DependencyState, PluginRecord
+from services.plugin_version_service import DependencyPlan, DependencyState, PluginRecord
 from services.update_service import FROZEN_PKGS
 from utils.common import run_hidden
 from utils import paths as PATHS

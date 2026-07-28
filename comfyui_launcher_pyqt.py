@@ -1,11 +1,133 @@
 import os
+import re
 import sys
 import warnings
 
 # Suppress sipPyTypeDict deprecation warning
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*sipPyTypeDict.*")
 
+# 抑制 Qt DirectWrite 字体警告。
+# Windows 高 DPI(如 150% 缩放)下 Qt 枚举系统字体时会反复尝试解析 Fixedsys /
+# Modern / MS Sans Serif / MS Serif / Roman / Script 这些旧位图字体,DirectWrite
+# 无法处理,每次刷一行 "CreateFontFaceFromHDC() failed" 警告。这些警告无害
+# (字体最终会回退到正常字体),纯粹是噪音,通过 logging rule 关掉。
+# 必须在 import PyQt5 之前设置。用无条件赋值覆盖用户 shell 里可能已设的其他值。
+# DirectWrite 负载失败在 Qt5 不同版本不同 category,多击击都覆盖上:
+#   qt.qpa.fonts     字体枚举阶段的警告
+#   qt.text.font     Qt5.9+ 的字体加载路径上下文
+#   qt.text.fonts    部分 patch 版本使用这个名称
+#   qt.text          全局文本模块下的警告全部抑制
+# 多个规则以 ";" 分隔。这一层为首选防线(过滤掉大多数警告);
+# 下面会加 qInstallMessageHandler 作为二层防线(抓住漏网的任何警告)。
+# 阶段性拦截: import PyQt5 之前包装 sys.stderr,
+# 过滤 DirectWrite 字体警告。该警告是 Qt DLL 在 import 阶段就输出的,
+# 比 qInstallMessageHandler 要装上更早, 所以 logging rule + message handler 都装太晚。
+# Python 层的 sys.stderr 包装可以接住所有走 stderr 的输出
+# (包括 Qt 内部 qWarning 走 stderr 那部分)。
+
+
+class _DirectWriteNoiseFilter:
+    """stderr 过滤器:
+    - 丢掉含 DirectWrite: CreateFontFaceFromHDC 的行 (Qt 字体警告)
+    - 从其他行中剥除 ANSI SGR 转义串 (Python logging 输出的 [1m[31m[ERROR][0m 类)。"""
+
+    _NEEDLE = "DirectWrite: CreateFontFaceFromHDC"
+    # ANSI SGR: ESC [ <参数> m。参数以 ; 分隔的数字 (颜色 / 加粗 / 背景色 / reset 等)。
+    # 不包括光标移动 / 清屏等 (H, J, K 等), 那些不在 PowerShell 能反应的范围内。
+    _SGR_RE = re.compile(r"\x1b\[[\d;]*m")
+
+    @classmethod
+    def _strip_sgr(cls, s: str) -> str:
+        return cls._SGR_RE.sub("", s)
+
+    def __init__(self, real):
+        self._real = real
+        self._buf = ""
+
+    def write(self, s):
+        if not s:
+            return
+        if not isinstance(s, str):
+            try:
+                s = s.decode("utf-8", errors="replace")
+            except Exception:
+                return self._real.write(s)
+        # 以\n为分隔索引拼接完整行, 避免一行被切两半
+        # 出现"半行是警告, 半行正常" 这种 bug。
+        data = self._buf + s
+        out = []
+        last_split = 0
+        for i, ch in enumerate(data):
+            if ch == "\n":
+                line = data[last_split:i]
+                last_split = i + 1
+                if self._NEEDLE in line:
+                    # 该行丢弃, 不加到 out
+                    continue
+                # 不含 DirectWrite 的行: 剥除 ANSI SGR 后转发
+                out.append(self._strip_sgr(line) + "\n")
+        self._buf = data[last_split:]
+        if out:
+            self._real.write("".join(out))
+
+    def flush(self):
+        if self._buf and self._NEEDLE not in self._buf:
+            self._real.write(self._strip_sgr(self._buf))
+        self._buf = ""
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        # 其他属性(isatty/fileno/...) 全部转发到原始 stream,
+        # 避免 colorama 等三方包调用 .isatty 报错。
+        return getattr(self._real, name)
+
+
+sys.stderr = _DirectWriteNoiseFilter(sys.stderr)
+
+
+os.environ["QT_LOGGING_RULES"] = (
+    "qt.qpa.fonts.warning=false;"
+    "qt.text.font.warning=false;"
+    "qt.text.fonts.warning=false;"
+    "qt.text.warning=false"
+)
+
 from PyQt5 import QtWidgets, QtCore, QtGui
+
+# 二层防线：装 message handler 拦截 Qt 消息。过滤:
+# 1) DirectWrite 字体负载失败 ("CreateFontFaceFromHDC() failed" 类)——无害,仅为警告;
+# 2) qt.qpa.fonts / qt.text.* category 下的任何 message（以防 logging rule 漏网）。
+# 其他消息全部放行。这个 handler 覆盖默认 handler,但只在本脚本进程内生效。
+_DIRECTWRITE_NOISE = (
+    "CreateFontFaceFromHDC",  # DirectWrite 负载失败的关键字符串
+)
+
+
+def _qt_message_handler(mode, ctx, msg):
+    """拦截 Qt 内部消息。对装中误以 DirectWrite 字体负载失败为默认抛弃。
+
+    参数 ctx 可能为 None（部分路径调用 handler 时不传 ctx）,以及不同 Qt 版本字段不同,所以做防御性访问。
+    """
+    try:
+        if msg and any(needle in msg for needle in _DIRECTWRITE_NOISE):
+            return  # 丢弃该条警告
+        cat = getattr(ctx, "category", "") if ctx is not None else ""
+        if cat and (
+            cat.startswith("qt.qpa.fonts")
+            or cat.startswith("qt.text")
+            and ("font" in cat or "Font" in cat)
+        ):
+            return
+    except Exception:
+        pass
+    # 其他消息走默认 handler（输出到 stderr、调试器等）
+    sys.stderr.write(f"{msg}\n")
+
+
+QtCore.qInstallMessageHandler(_qt_message_handler)
 
 # -----------------------------------------------------------------------------
 # Fix for PyQt5 plugins + DLL path in PyInstaller onedir + Enigma Virtual Box

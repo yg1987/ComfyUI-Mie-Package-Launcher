@@ -268,3 +268,220 @@ class TestStartFunction:
         worker_func()
 
         assert mock_pm.comfyui_process is not None
+
+
+class TestSpawnProcessLogRedirect:
+    """Tests for _spawn_process stdout/stderr redirect to log file."""
+
+    @pytest.fixture
+    def mock_pm(self):
+        pm = MagicMock()
+        pm.comfyui_process = None
+        return pm
+
+    def test_existing_log_without_newline_gets_run_boundary(self, mock_pm, monkeypatch, tmp_path):
+        monkeypatch.setattr(os, "name", "posix")
+        log = tmp_path / "out.log"
+        log.write_bytes(b"previous run")
+        with patch("core.runner_start.subprocess.Popen") as mock_popen:
+            from core.runner_start import _spawn_process
+            _spawn_process(mock_pm, ["cmd"], {}, "/cwd", show_console=False, log_path=log)
+            mock_pm._log_file_handle.flush()
+            mock_pm._log_file_handle.close()
+        assert log.read_bytes() == b"previous run\n"
+
+    def test_show_console_false_redirects_stdout_to_log(
+        self, mock_pm, monkeypatch
+    ):
+        """show_console=False with log_path passes open file to Popen as stdout."""
+        from pathlib import Path
+        import tempfile
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x8000000, raising=False)
+        monkeypatch.setattr(subprocess, "STARTUPINFO", MagicMock, raising=False)
+        monkeypatch.setattr(subprocess, "STARTF_USESHOWWINDOW", 0x4, raising=False)
+        monkeypatch.setattr(subprocess, "SW_HIDE", 0, raising=False)
+        monkeypatch.setattr(subprocess, "STDOUT", -2, raising=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "out.log")
+            log_path_obj = Path(log)
+            with patch("core.runner_start.subprocess.Popen") as mock_popen:
+                mock_proc = MagicMock()
+                mock_popen.return_value = mock_proc
+
+                from core.runner_start import _spawn_process
+                _spawn_process(mock_pm, ["cmd"], {}, "/cwd", show_console=False, log_path=log)
+
+                call = mock_popen.call_args
+                assert call.kwargs.get("stdout") is not None, "stdout should be set to a file"
+                # 文件 handle 必须是 open 状态且 path 正确
+                stdout_handle = call.kwargs["stdout"]
+                stdout_handle.write(b"hello\n")
+                stdout_handle.flush()
+                stdout_handle.close()
+                assert log_path_obj.read_bytes() == b"hello\n"
+                try:
+                    mock_pm._log_file_handle.close()
+                except Exception:
+                    pass
+
+    def test_show_console_false_merges_stderr_into_stdout(
+        self, mock_pm, monkeypatch
+    ):
+        """show_console=False with log_path passes stderr=STDOUT to Popen."""
+        from pathlib import Path
+        import tempfile
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x8000000, raising=False)
+        monkeypatch.setattr(subprocess, "STARTUPINFO", MagicMock, raising=False)
+        monkeypatch.setattr(subprocess, "STARTF_USESHOWWINDOW", 0x4, raising=False)
+        monkeypatch.setattr(subprocess, "SW_HIDE", 0, raising=False)
+        monkeypatch.setattr(subprocess, "STDOUT", -2, raising=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "out.log")
+            log_path_obj = Path(log)
+            with patch("core.runner_start.subprocess.Popen") as mock_popen:
+                from core.runner_start import _spawn_process
+                _spawn_process(mock_pm, ["cmd"], {}, "/cwd", show_console=False, log_path=log)
+
+                call = mock_popen.call_args
+                assert call.kwargs.get("stderr") == -2, (
+                    "stderr should be redirected to STDOUT to merge streams"
+                )
+                try:
+                    mock_pm._log_file_handle.close()
+                except Exception:
+                    pass
+
+    def test_show_console_true_captures_output_when_log_path_present(
+        self, mock_pm, monkeypatch
+    ):
+        """显示 CMD 时也必须捕获输出，实时日志才能收到 tqdm 的回车刷新。"""
+        import tempfile
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x8000000, raising=False)
+        monkeypatch.setattr(subprocess, "STARTUPINFO", MagicMock, raising=False)
+        monkeypatch.setattr(subprocess, "STARTF_USESHOWWINDOW", 0x4, raising=False)
+        monkeypatch.setattr(subprocess, "SW_HIDE", 0, raising=False)
+        monkeypatch.setattr(subprocess, "STDOUT", -2, raising=False)
+        monkeypatch.setattr(subprocess, "PIPE", -1, raising=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "out.log")
+            with patch("core.runner_start.subprocess.Popen") as mock_popen, \
+                 patch("core.runner_start._start_log_pump") as mock_pump, \
+                 patch("core.runner_start._start_console_log_window") as mock_window:
+                proc = MagicMock()
+                proc.stdout = MagicMock()
+                mock_popen.return_value = proc
+                from core.runner_start import _spawn_process
+                _spawn_process(mock_pm, ["cmd"], {}, "/cwd", show_console=True, log_path=log)
+
+                call = mock_popen.call_args
+                assert call.kwargs.get("stdout") == -1
+                assert call.kwargs.get("stderr") == -2
+                assert call.kwargs.get("creationflags") == 0x8000000
+                mock_pump.assert_called_once_with(mock_pm, proc.stdout, mock_pm._log_file_handle)
+                mock_window.assert_called_once()
+                mock_pm._log_file_handle.close()
+
+    def test_log_pump_prefers_read1_for_pipe_latency(self):
+        from core.runner_start import _pump_output
+        source = MagicMock()
+        source.read1.side_effect = [b"10%\r", b"20%\r", b""]
+        target = MagicMock()
+        _pump_output(source, target)
+        assert source.read1.call_count == 3
+        assert target.write.call_args_list == [
+            __import__("unittest").mock.call(b"10%\r"),
+            __import__("unittest").mock.call(b"20%\r"),
+        ]
+        assert target.flush.call_count == 2
+
+    def test_log_pump_flushes_each_chunk(self, tmp_path):
+        import io
+        from core.runner_start import _pump_output
+        source = io.BytesIO(b"10%\r20%\r")
+        target = MagicMock()
+        _pump_output(source, target)
+        assert target.write.call_count == 1
+        target.flush.assert_called_once()
+
+    def test_show_console_true_without_log_path_keeps_inherit(self, mock_pm, monkeypatch):
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(subprocess, "CREATE_NEW_CONSOLE", 0x10, raising=False)
+        monkeypatch.setattr(subprocess, "STARTUPINFO", MagicMock, raising=False)
+        monkeypatch.setattr(subprocess, "STARTF_USESHOWWINDOW", 0x4, raising=False)
+        monkeypatch.setattr(subprocess, "SW_HIDE", 0, raising=False)
+        with patch("core.runner_start.subprocess.Popen") as mock_popen, \
+             patch("core.runner_start._start_console_log_window") as mock_window:
+            from core.runner_start import _spawn_process
+            _spawn_process(mock_pm, ["cmd"], {}, "/cwd", show_console=True, log_path=None)
+            call = mock_popen.call_args
+            assert call.kwargs.get("stdout") is None
+            assert call.kwargs.get("stderr") is None
+            mock_window.assert_not_called()
+
+    def test_show_console_false_no_log_path_keeps_inherit(
+        self, mock_pm, monkeypatch
+    ):
+        """show_console=False without log_path falls back to inherited std handles."""
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x8000000, raising=False)
+        monkeypatch.setattr(subprocess, "STARTUPINFO", MagicMock, raising=False)
+        monkeypatch.setattr(subprocess, "STARTF_USESHOWWINDOW", 0x4, raising=False)
+        monkeypatch.setattr(subprocess, "SW_HIDE", 0, raising=False)
+
+        with patch("core.runner_start.subprocess.Popen") as mock_popen:
+            from core.runner_start import _spawn_process
+            _spawn_process(mock_pm, ["cmd"], {}, "/cwd", show_console=False, log_path=None)
+
+            call = mock_popen.call_args
+            assert call.kwargs.get("stdout") is None
+            assert call.kwargs.get("stderr") is None
+
+
+class TestStartPassesLogPath:
+    """Tests for start() forwarding log_path to _spawn_process."""
+
+    @pytest.fixture
+    def mock_app(self):
+        app = MagicMock()
+        app.big_btn = MagicMock()
+        app._launching = False
+        app.logger = MagicMock()
+        return app
+
+    @pytest.fixture
+    def mock_pm(self):
+        pm = MagicMock()
+        pm.comfyui_process = None
+        return pm
+
+    def test_start_forwards_log_path_to_spawn(
+        self, mock_app, mock_pm, monkeypatch
+    ):
+        """start(log_path=...) passes it to _spawn_process."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "out.log")
+            log_path_obj = __import__("pathlib").Path(log)
+            with patch("core.runner_start._spawn_process") as mock_spawn:
+                with patch("core.runner_start.threading.Thread") as mock_thread:
+                    mock_thread.return_value = MagicMock()
+
+                    from core.runner_start import start
+                    with patch("core.runner_start._check_system_stats", return_value=True), \
+                         patch("core.runner_start.time.sleep"):
+                        start(mock_app, mock_pm, ["cmd"], {}, "/cwd", log_path=log)
+
+                        worker_func = mock_thread.call_args[1]["target"]
+                        worker_func()
+
+                    # worker 调过 _spawn_process 时把 log_path 传下去了
+                    assert mock_spawn.called
+                    kwargs = mock_spawn.call_args.kwargs
+                    assert kwargs.get("log_path") == log

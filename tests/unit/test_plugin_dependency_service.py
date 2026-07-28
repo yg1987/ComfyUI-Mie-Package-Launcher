@@ -11,7 +11,7 @@ from services.plugin_dependency_service import (
     GlobalDependencyIndex,
     PluginDependencyService,
 )
-from services.plugin_service import DependencyState, PluginRecord, PluginState
+from services.plugin_version_service import DependencyState, PluginRecord, PluginState
 
 
 class TestPluginDependencyService(unittest.TestCase):

@@ -1,7 +1,7 @@
 from PyQt5 import QtCore, QtWidgets
 
 from core.plugin_workers import PluginTaskController
-from services.plugin_service import PluginService, PluginState
+from services.plugin_version_service import PluginVersionService, PluginState
 from .base_page import BasePage
 
 
@@ -11,7 +11,7 @@ class PluginPage(BasePage):
     def __init__(self, app, theme_manager, parent=None):
         self.app = app
         super().__init__(theme_manager, parent)
-        service = getattr(getattr(app, "services", None), "plugin", None) or PluginService(app)
+        service = getattr(getattr(app, "services", None), "plugin_versions", None) or PluginVersionService(app)
         self.controller = PluginTaskController(service, self)
         self.records = []
         self.page = 0
@@ -24,7 +24,7 @@ class PluginPage(BasePage):
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel("插件管理"))
+        layout.addWidget(QtWidgets.QLabel("插件版本管理"))
         layout.addWidget(QtWidgets.QLabel("管理 ComfyUI/custom_nodes 中的 GitHub 插件；更新前请停止 ComfyUI。"))
         install_row = QtWidgets.QHBoxLayout()
         self.url_input = QtWidgets.QLineEdit()
