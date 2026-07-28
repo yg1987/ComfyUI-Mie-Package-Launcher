@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tempfile
@@ -495,7 +496,23 @@ class PluginDependencyService:
     def _run(self, command: Sequence[str], timeout: int) -> subprocess.CompletedProcess:
         command = list(command)
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            # All dependency preflight/install commands run from the GUI worker.
+            # Explicit streams prevent the embedded Python/pip process from
+            # inheriting the launcher's invalid stdin handle on Windows.
+            kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+            }
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                kwargs["startupinfo"] = startupinfo
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            process = subprocess.Popen(command, **kwargs)
             self._active_processes.add(process)
             try:
                 stdout, stderr = process.communicate(timeout=timeout)

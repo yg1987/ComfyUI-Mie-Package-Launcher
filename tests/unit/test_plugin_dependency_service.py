@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from services.plugin_dependency_service import (
     DependencyPreflight,
@@ -102,6 +102,21 @@ class TestPluginDependencyService(unittest.TestCase):
             self.assertTrue(any("--dry-run" in command and "--report" in command for command in commands))
         finally:
             self.service.cleanup(preflight)
+
+    def test_dependency_commands_never_inherit_gui_standard_handles(self):
+        process = Mock()
+        process.communicate.return_value = ("ok", "")
+        process.returncode = 0
+
+        with patch("services.plugin_dependency_service.subprocess.Popen", return_value=process) as popen:
+            result = self.service._run(["python", "-m", "pip", "check"], timeout=10)
+
+        self.assertEqual(result.returncode, 0)
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ["python", "-m", "pip", "check"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.PIPE)
+        self.assertIs(kwargs["stderr"], subprocess.PIPE)
 
     def test_failed_offline_install_restores_the_previously_changed_package(self):
         candidate = self._plugin("new-plugin", "a>=4\n")
