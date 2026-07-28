@@ -130,11 +130,14 @@ python __main__.py <command> [--json] [-v]
 ```powershell
 $env:CL = '/utf-8'
 & 'D:\CodexTools\launcher-build\Scripts\python.exe' build.py `
+  --test `
   --python-path 'D:\CodexTools\launcher-build\Scripts\python.exe' `
   --enigma-path 'D:\CodexTools\EnigmaVirtualBox\enigmavbconsole.exe'
 ```
 
 - 必须保留 `$env:CL = '/utf-8'`：项目的中文产品元数据会进入 Nuitka 自动生成的 C 头文件；缺少该选项时，MSVC 936 代码页可能报 `C4819` / `C2001: 常量中有换行符`。
+- **本机构建一律使用 `--test`**（也是脚本默认值），Release 文件名必须带 `_test.exe`；不要把本机验证包当正式发布物。
+- GitHub Actions 使用 `build.py --release` 生成正式包：exe 文件名不得含 `test`，并上传到 GitHub Release。正式 Release 标签会规范为单个 `v` 前缀（例如 `v1.0.14-build.21`）。
 - 构建会重建 `dist/ComfyUI启动器.dist`，并在 `release/` 生成单文件产物 `ComfyUI启动器_v<版本>_<时间戳>.exe`。这是正常且已授权的构建副作用。
 - 构建后至少确认产物存在、大小和 SHA-256，例如：
 
