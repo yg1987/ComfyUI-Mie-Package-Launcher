@@ -31,7 +31,7 @@ jobs:
           $installer = Join-Path $env:RUNNER_TEMP 'enigmavb.exe'
           Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' -OutFile $installer
           $actualHash = (Get-FileHash -Path $installer -Algorithm SHA256).Hash
-          $expectedHash = 'AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35'
+          $expectedHash = 'CF47AA8568983272A5995BBEB768F3A2CB6E8C4B065EADB8C4EDA368FD783A39'
           if ($actualHash -ne $expectedHash) {
             throw "Unexpected Enigma Virtual Box installer SHA-256: $actualHash"
           }
