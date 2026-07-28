@@ -1,0 +1,57 @@
+name: Build Windows release package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - my-changes
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build formal Windows test release
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt nuitka
+          choco install enigmavirtualbox --yes --no-progress --limit-output
+
+      - name: Map the existing Enigma project path
+        shell: pwsh
+        run: |
+          $workspaceParent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          subst F: $workspaceParent
+          if (-not (Test-Path 'F:\ComfyUI-Mie-Package-Launcher\EnigmaVirtualBox\launcher.evb')) {
+            throw 'The Enigma project path was not mapped as expected.'
+          }
+
+      - name: Build formal test release
+        shell: pwsh
+        run: |
+          python build.py --test
+          $release = Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue
+          if (-not $release) {
+            throw 'The formal release executable was not created.'
+          }
+
+      - name: Upload formal test release
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfyui-launcher-test-release-${{ github.sha }}
+          path: release/*.exe
+          if-no-files-found: error
+          retention-days: 14
