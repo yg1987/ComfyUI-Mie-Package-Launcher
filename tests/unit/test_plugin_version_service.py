@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from services.plugin_version_service import DependencyPlan, DependencyState, PluginInstallPreview, PluginRecord, PluginVersionService, PluginState, UpdateAvailability
 
@@ -140,6 +140,21 @@ class TestPluginVersionServiceScanLocal(unittest.TestCase):
         self.assertIs(kwargs["stdout"], subprocess.PIPE)
         self.assertIs(kwargs["stderr"], subprocess.PIPE)
         self.assertEqual(kwargs["timeout"], 12)
+
+    def test_execute_git_never_inherits_gui_standard_handles(self):
+        process = Mock()
+        process.communicate.return_value = ("ok", "")
+        process.returncode = 0
+
+        with patch("services.plugin_version_service.subprocess.Popen", return_value=process) as popen:
+            result = self.service._execute_git(["git", "status"], timeout=10)
+
+        self.assertEqual(result.returncode, 0)
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ["git", "status"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.PIPE)
+        self.assertIs(kwargs["stderr"], subprocess.PIPE)
 
     def test_uninstall_removes_only_a_direct_plugin_directory(self):
         plugin = self.custom_nodes / "remove-me"

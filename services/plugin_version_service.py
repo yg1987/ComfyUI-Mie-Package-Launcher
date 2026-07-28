@@ -653,7 +653,24 @@ class PluginVersionService:
 
     def _execute_git(self, command, timeout):
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            # This path is used after cloning to inspect the temporary Git
+            # repository.  A GUI launch can expose an invalid inherited stdin
+            # handle (WinError 6), so never let Popen inherit any standard
+            # handles from the launcher process.
+            kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+            }
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                kwargs["startupinfo"] = startupinfo
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            process = subprocess.Popen(command, **kwargs)
             self._active_processes.add(process)
             try:
                 stdout, stderr = process.communicate(timeout=timeout)
