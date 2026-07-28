@@ -28,7 +28,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt nuitka
-          choco install enigmavirtualbox --yes --no-progress --limit-output
+          $installer = Join-Path $env:RUNNER_TEMP 'enigmavb.exe'
+          Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' -OutFile $installer
+          $actualHash = (Get-FileHash -Path $installer -Algorithm SHA256).Hash
+          $expectedHash = 'AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35'
+          if ($actualHash -ne $expectedHash) {
+            throw "Unexpected Enigma Virtual Box installer SHA-256: $actualHash"
+          }
+          Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -NoNewWindow
+          if (-not (Test-Path 'C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe')) {
+            throw 'Enigma Virtual Box console was not installed to the expected location.'
+          }
 
       - name: Map the existing Enigma project path
         shell: pwsh
