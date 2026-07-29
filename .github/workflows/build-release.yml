@@ -25,20 +25,28 @@ jobs:
 
       - name: Install build dependencies
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt nuitka
-          # The vendor installer occasionally lands on a damaged temporary file in
-          # the hosted runner.  Download each attempt to C: (not RUNNER_TEMP) and
-          # retry with a fresh file before declaring the build failed.
+          # GitHub-hosted runners are currently blocked by the vendor host.  Use
+          # the signed upstream installer cached in this repository's prerelease,
+          # then verify its Authenticode signature before every installation.
           $installerDir = Join-Path $env:SystemDrive 'enigma-installers'
           New-Item -ItemType Directory -Force -Path $installerDir | Out-Null
           $installed = $false
           for ($attempt = 1; $attempt -le 3 -and -not $installed; $attempt++) {
             $installer = Join-Path $installerDir "enigmavb-$env:GITHUB_RUN_ID-$attempt.exe"
             try {
-              Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' `
-                -OutFile $installer -MaximumRedirection 5 -ErrorAction Stop
+              gh release download enigma-v11.30-build20250428 `
+                --repo $env:GITHUB_REPOSITORY --pattern 'enigmavb-probe.bin' `
+                --dir $installerDir --clobber
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not download the cached Enigma installer (exit code $LASTEXITCODE)."
+              }
+              Move-Item -LiteralPath (Join-Path $installerDir 'enigmavb-probe.bin') `
+                -Destination $installer -Force
               if ((Get-Item -LiteralPath $installer).Length -lt 1MB) {
                 throw 'The downloaded Enigma Virtual Box installer is unexpectedly small.'
               }
