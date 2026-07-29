@@ -30,11 +30,11 @@ class TestPluginWorkers(unittest.TestCase):
         cls.qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def test_worker_is_qthread(self):
-        worker = PluginTaskWorker(SimpleNamespace(scan_local=lambda: []), "scan")
+        worker = PluginTaskWorker(SimpleNamespace(load_cached_records=lambda: []), "scan")
         self.assertIsInstance(worker, QtCore.QThread)
 
     def test_controller_refuses_second_task_while_first_is_running(self):
-        service = SimpleNamespace(scan_local=lambda: [])
+        service = SimpleNamespace(load_cached_records=lambda: [])
         controller = PluginTaskController(service)
         controller._worker = SimpleNamespace(isRunning=lambda: True, request_cancel=lambda: None)
 
@@ -43,7 +43,7 @@ class TestPluginWorkers(unittest.TestCase):
 
     def test_worker_scan_emits_records(self):
         observed = []
-        worker = PluginTaskWorker(SimpleNamespace(scan_local=lambda: ["record"]), "scan")
+        worker = PluginTaskWorker(SimpleNamespace(load_cached_records=lambda: ["record"]), "scan")
         worker.finished_results.connect(observed.append)
 
         worker.run()
@@ -70,7 +70,7 @@ class TestPluginWorkers(unittest.TestCase):
 
     def test_results_are_emitted_only_after_worker_cleanup(self):
         """A result handler must be able to start another task safely."""
-        controller = PluginTaskController(SimpleNamespace(scan_local=lambda: []))
+        controller = PluginTaskController(SimpleNamespace(load_cached_records=lambda: []))
         worker_at_result = []
         completed = []
         controller.finished.connect(
@@ -177,6 +177,34 @@ class TestPluginWorkers(unittest.TestCase):
         finally:
             page.close()
 
+    def test_copyable_details_hides_help_button_and_keeps_text_readable(self):
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        observed = {}
+
+        def inspect_dialog():
+            dialog = self.qt_app.activeModalWidget()
+            observed["dialog"] = dialog
+            observed["has_help_button"] = bool(
+                dialog.windowFlags() & QtCore.Qt.WindowContextHelpButtonHint
+            )
+            text = dialog.findChild(QtWidgets.QPlainTextEdit)
+            observed["text"] = text.toPlainText()
+            observed["style"] = text.styleSheet()
+            dialog.accept()
+
+        try:
+            QtCore.QTimer.singleShot(0, inspect_dialog)
+            page._show_copyable_details("结果", "")
+
+            self.assertIsNotNone(observed.get("dialog"))
+            self.assertFalse(observed["has_help_button"])
+            self.assertEqual(observed["text"], "没有可显示的详细信息。")
+            self.assertIn("color: #E5E7EB", observed["style"])
+        finally:
+            page.close()
+
     def test_status_detail_contains_full_reason_and_processing_guidance(self):
         service = SimpleNamespace(refresh_all=lambda: [])
         app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
@@ -224,11 +252,8 @@ class TestPluginWorkers(unittest.TestCase):
             self.assertEqual(self.qt_app.clipboard().text(), source)
             self.assertEqual(page.feedback_label.text(), "地址已复制")
 
-            page._show_copyable_details = Mock()
             page._update_all()
-            self.assertEqual(page.feedback_label.text(), "没有可更新的插件。")
-            page._show_copyable_details.assert_called_once()
-            self.assertIn("当前没有可安全更新的插件。", page._show_copyable_details.call_args.args[1])
+            self.assertEqual(page.feedback_label.text(), "所有已检查的插件均已是最新版本。")
         finally:
             page.close()
 
@@ -242,15 +267,35 @@ class TestPluginWorkers(unittest.TestCase):
             remote_url_display="https://github.com/example/example-plugin.git",
         )]
         try:
-            page._show_copyable_details = Mock()
             page._update_all()
 
-            self.assertEqual(page.feedback_label.text(), "请先刷新检查插件更新。")
-            page._show_copyable_details.assert_called_once()
-            self.assertEqual(page._show_copyable_details.call_args.args[0], "请先检查更新")
-            details = page._show_copyable_details.call_args.args[1]
-            self.assertIn("未执行任何更新操作", details)
-            self.assertIn("请先点击“刷新”", details)
+            self.assertEqual(page.feedback_label.text(), "尚有 1 个插件未检查更新；请先点击“刷新”。")
+        finally:
+            page.close()
+
+    def test_compact_confirmation_does_not_create_a_details_editor(self):
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        observed = {}
+
+        def inspect_dialog():
+            dialog = self.qt_app.activeModalWidget()
+            observed["dialog"] = dialog
+            observed["details_editor"] = dialog.findChild(QtWidgets.QPlainTextEdit)
+            observed["message"] = dialog.findChild(QtWidgets.QLabel).text()
+            dialog.reject()
+
+        try:
+            QtCore.QTimer.singleShot(0, inspect_dialog)
+            accepted = page._confirm_action(
+                "确认卸载插件", "将永久删除插件目录。", "卸载插件", destructive=True
+            )
+
+            self.assertFalse(accepted)
+            self.assertIsNotNone(observed.get("dialog"))
+            self.assertIsNone(observed["details_editor"])
+            self.assertEqual(observed["message"], "将永久删除插件目录。")
         finally:
             page.close()
 
@@ -293,11 +338,13 @@ class TestPluginWorkers(unittest.TestCase):
             self.assertEqual(page.feedback_label.text(), "正在处理 1/2：example-plugin（成功）")
 
             page._show_copyable_details = Mock()
-            page._show_operation_results("update", [result, failed_result])
+            page._show_operation_results("update", [result, failed_result], refreshed=True)
             self.assertEqual(page.feedback_label.text(), "更新结果已完成：成功 1 项，失败 1 项。")
             page._show_copyable_details.assert_called_once()
-            self.assertIn("插件与依赖已更新", page._show_copyable_details.call_args.args[1])
-            self.assertIn("Git fast-forward 失败", page._show_copyable_details.call_args.args[1])
+            details = page._show_copyable_details.call_args.args[1]
+            self.assertIn("插件列表与状态已刷新", details)
+            self.assertIn("插件与依赖已更新", details)
+            self.assertIn("Git fast-forward 失败", details)
         finally:
             page.close()
 
@@ -354,7 +401,9 @@ class TestPluginWorkers(unittest.TestCase):
         service = SimpleNamespace(refresh_all=lambda: [])
         app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
         page = PluginPage(app_context, ThemeManager())
-        result = SimpleNamespace(operation="update", plugin_name="example-plugin")
+        result = SimpleNamespace(
+            operation="update", plugin_name="example-plugin", outcome="success"
+        )
         try:
             page._active_operation = "update"
             page._show_operation_results = Mock()
@@ -363,9 +412,35 @@ class TestPluginWorkers(unittest.TestCase):
 
             page._on_finished([result])
 
-            page._show_operation_results.assert_called_once_with("update", [result])
+            page._show_operation_results.assert_not_called()
             page._start_refresh.assert_called_once()
             page._start_scan.assert_not_called()
+
+            # 结果框在刷新结果到达后才显示，关闭它不会触发新的后台任务。
+            page._active_operation = "refresh"
+            page._on_finished([])
+            page._show_operation_results.assert_called_once_with(
+                "update", [result], refreshed=True
+            )
+        finally:
+            page.close()
+
+    def test_completed_install_refreshes_before_showing_results(self):
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        result = SimpleNamespace(
+            operation="install", plugin_name="example-plugin", outcome="success"
+        )
+        try:
+            page._active_operation = "install"
+            page._show_operation_results = Mock()
+            page._start_refresh = Mock()
+
+            page._on_finished([result])
+
+            page._show_operation_results.assert_not_called()
+            page._start_refresh.assert_called_once()
         finally:
             page.close()
 
@@ -385,6 +460,22 @@ class TestPluginWorkers(unittest.TestCase):
             self.assertTrue(all(not button.isEnabled() for button in page._operation_buttons))
             page._set_busy(False)
             self.assertTrue(all(button.isEnabled() for button in page._operation_buttons))
+        finally:
+            page.close()
+
+    def test_cached_startup_load_hides_progress_and_explains_remote_is_stale(self):
+        service = SimpleNamespace(load_cached_records=lambda: [], last_cached_at=None)
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        record = PluginRecord("example-plugin", Path("example-plugin"), PluginState.LOCAL_ONLY)
+        try:
+            page._active_operation = "scan"
+            page._set_busy(True)
+            self.assertFalse(page.progress.isVisible())
+
+            page._on_finished([record])
+
+            self.assertIn("尚未检查远端更新", page.feedback_label.text())
         finally:
             page.close()
 

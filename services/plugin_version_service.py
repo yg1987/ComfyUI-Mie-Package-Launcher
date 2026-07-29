@@ -16,10 +16,12 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 from typing import Callable, Literal, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
+from services.plugin_status_cache import PluginStatusCache
 from utils.common import run_hidden
 
 
@@ -166,6 +168,8 @@ class PluginVersionService:
         self._dependency_service = None
         self._install_previews = {}
         self._active_processes = set()
+        self._status_cache = PluginStatusCache(app)
+        self.last_cached_at: Optional[str] = None
 
     def cancel_active_processes(self):
         for process in tuple(self._active_processes):
@@ -178,12 +182,85 @@ class PluginVersionService:
 
     def custom_nodes_root(self) -> Path:
         try:
-            portable_root = Path(
-                self.app.config.get("paths", {}).get("comfyui_root") or "."
-            ).resolve()
+            paths = (
+                self.app.get_active_paths()
+                if hasattr(self.app, "get_active_paths")
+                else self.app.config.get("paths", {})
+            )
+            portable_root = Path(paths.get("comfyui_root") or ".").resolve()
         except Exception:
             portable_root = Path(".").resolve()
         return portable_root / "ComfyUI" / "custom_nodes"
+
+    def load_cached_records(self) -> list[PluginRecord]:
+        """List current plugin directories and merge their last saved status.
+
+        This is intentionally the page's startup path: it reads only the
+        directory listing and the launcher's own JSON cache, never Git.
+        """
+        root = self.custom_nodes_root()
+        self.last_cached_at = None
+        if not root.is_dir():
+            return []
+        cached, self.last_cached_at = self._status_cache.load(
+            self._environment_id(), root
+        )
+        try:
+            candidates = sorted(root.iterdir(), key=lambda item: item.name.casefold())
+        except OSError:
+            return []
+        return [
+            self._record_from_cache(candidate, cached.get(candidate.name))
+            for candidate in candidates
+            if candidate.name != ".git"
+            and not candidate.name.startswith(".launcher-")
+            and candidate.is_dir()
+        ]
+
+    def _environment_id(self) -> str:
+        try:
+            value = self.app.config.get("active_env_id")
+            return str(value) if value else "__legacy__"
+        except Exception:
+            return "__legacy__"
+
+    @staticmethod
+    def _cache_enum(enum_type, value, default):
+        try:
+            return enum_type(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _record_from_cache(self, path: Path, payload: Optional[dict]) -> PluginRecord:
+        if not isinstance(payload, dict):
+            return PluginRecord(path.name, path, PluginState.LOCAL_ONLY)
+        checked_at = None
+        try:
+            checked_at = datetime.fromisoformat(payload.get("checked_at"))
+        except (TypeError, ValueError):
+            pass
+        return PluginRecord(
+            name=path.name,
+            path=path,
+            state=self._cache_enum(PluginState, payload.get("state"), PluginState.LOCAL_ONLY),
+            update_availability=self._cache_enum(UpdateAvailability, payload.get("update_availability"), UpdateAvailability.UNKNOWN),
+            dependency_state=self._cache_enum(DependencyState, payload.get("dependency_state"), DependencyState.UNKNOWN),
+            head=payload.get("head"), local_commit_at=payload.get("local_commit_at"),
+            remote_commit_at=payload.get("remote_commit_at"), branch=payload.get("branch"),
+            upstream=payload.get("upstream"), remote_name=payload.get("remote_name"),
+            remote_url_display=payload.get("remote_url_display"),
+            dirty_count=int(payload.get("dirty_count") or 0),
+            untracked_count=int(payload.get("untracked_count") or 0),
+            ahead=payload.get("ahead"), behind=payload.get("behind"), checked_at=checked_at,
+            target_head=payload.get("target_head"),
+            dependency_additions=tuple(payload.get("dependency_additions") or ()),
+            dependency_changes=tuple(payload.get("dependency_changes") or ()),
+            dependency_strict_constraints=tuple(payload.get("dependency_strict_constraints") or ()),
+            dependency_conflicts=tuple(payload.get("dependency_conflicts") or ()),
+            dependency_reason=str(payload.get("dependency_reason") or ""),
+            reason=str(payload.get("reason") or ""), error_code=payload.get("error_code"),
+            can_check=bool(payload.get("can_check")), can_update=bool(payload.get("can_update")),
+        )
 
     def scan_local(self) -> list[PluginRecord]:
         """Return every direct plugin directory without making network calls."""
@@ -364,17 +441,21 @@ class PluginVersionService:
     def refresh_all(self) -> list[PluginRecord]:
         records = [self.check_one(record) if record.can_check else record for record in self.scan_local()]
         candidates = [record for record in records if record.state == PluginState.UPDATE_AVAILABLE and record.target_head]
-        if not candidates:
-            return records
-        dependency = self._dependencies()
-        index = dependency.build_global_index(records, {record.path: record.target_head for record in candidates})
-        preflight = dependency.preflight_many(index, candidates)
-        for record in candidates:
-            plan = preflight.plans.get(record.path.resolve())
-            if plan is None:
-                continue
-            self._apply_dependency_plan(record, plan)
-        dependency.cleanup(preflight)
+        if candidates:
+            dependency = self._dependencies()
+            index = dependency.build_global_index(records, {record.path: record.target_head for record in candidates})
+            preflight = dependency.preflight_many(index, candidates)
+            for record in candidates:
+                plan = preflight.plans.get(record.path.resolve())
+                if plan is None:
+                    continue
+                self._apply_dependency_plan(record, plan)
+            dependency.cleanup(preflight)
+        try:
+            self._status_cache.save(self._environment_id(), self.custom_nodes_root(), records)
+            self.last_cached_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        except OSError:
+            pass
         return records
 
     def update_one(self, record: PluginRecord) -> PluginOperationResult:
@@ -501,10 +582,49 @@ class PluginVersionService:
         except ValueError as exc:
             return PluginOperationResult(record.name, "uninstall", "failed", record.state, message=str(exc))
         try:
-            shutil.rmtree(path)
+            removal_error = self._remove_plugin_tree(path)
         except OSError as exc:
             return PluginOperationResult(record.name, "uninstall", "failed", record.state, message=f"插件目录未完全删除：{exc}")
+        if removal_error is not None:
+            return PluginOperationResult(
+                record.name,
+                "uninstall",
+                "failed",
+                record.state,
+                message=(
+                    f"插件目录未完全删除：{removal_error}。"
+                    "请关闭可能占用文件的 Git、资源管理器预览或杀毒扫描后重试"
+                ),
+            )
         return PluginOperationResult(record.name, "uninstall", "success", PluginState.REMOVED, message="插件目录已删除")
+
+    def _remove_plugin_tree(self, path: Path) -> Optional[OSError]:
+        """Remove a validated plugin directory, tolerating transient Windows locks."""
+        last_error = None
+        for attempt in range(3):
+            try:
+                shutil.rmtree(path, onerror=self._make_writable_then_retry)
+                return None
+            except OSError as exc:
+                last_error = exc
+                if attempt == 2 or not self._is_retryable_removal_error(exc):
+                    return exc
+                time.sleep(0.2 * (attempt + 1))
+        return last_error
+
+    @staticmethod
+    def _make_writable_then_retry(func, target, _exc_info) -> None:
+        """Clear a Windows read-only attribute before repeating rmtree's action."""
+        try:
+            current_mode = os.stat(target, follow_symlinks=False).st_mode
+            os.chmod(target, current_mode | stat.S_IWRITE)
+        except OSError:
+            pass
+        func(target)
+
+    @staticmethod
+    def _is_retryable_removal_error(exc: OSError) -> bool:
+        return getattr(exc, "winerror", None) in {5, 32} or exc.errno in {5, 13, 16, 32}
 
     @staticmethod
     def cleanup_staging(staging_path: Path) -> None:

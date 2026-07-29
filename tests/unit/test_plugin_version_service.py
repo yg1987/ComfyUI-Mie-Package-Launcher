@@ -168,6 +168,42 @@ class TestPluginVersionServiceScanLocal(unittest.TestCase):
         self.assertEqual(result.outcome, "success")
         self.assertFalse(plugin.exists())
 
+    def test_uninstall_retries_transient_access_denied(self):
+        plugin = self.custom_nodes / "locked-plugin"
+        plugin.mkdir()
+        record = PluginRecord("locked-plugin", plugin, PluginState.NON_GIT)
+        denied = PermissionError(13, "Permission denied")
+
+        with patch("services.plugin_version_service.shutil.rmtree", side_effect=[denied, None]) as remove, \
+             patch("services.plugin_version_service.time.sleep") as sleep:
+            result = self.service.uninstall_one(record)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(remove.call_count, 2)
+        sleep.assert_called_once_with(0.2)
+
+    def test_uninstall_explains_persistent_access_denied(self):
+        plugin = self.custom_nodes / "still-locked-plugin"
+        plugin.mkdir()
+        record = PluginRecord("still-locked-plugin", plugin, PluginState.NON_GIT)
+
+        with patch("services.plugin_version_service.shutil.rmtree", side_effect=PermissionError(13, "Permission denied")), \
+             patch("services.plugin_version_service.time.sleep"):
+            result = self.service.uninstall_one(record)
+
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("Git、资源管理器预览或杀毒扫描", result.message)
+
+    def test_remove_tree_clears_readonly_attribute_before_retrying_action(self):
+        target = self.custom_nodes / "readonly-file.txt"
+        target.write_text("readonly", encoding="utf-8")
+        retried = Mock()
+
+        self.service._make_writable_then_retry(retried, str(target), None)
+
+        retried.assert_called_once_with(str(target))
+        self.assertTrue(target.stat().st_mode & __import__("stat").S_IWRITE)
+
     def test_check_one_marks_clean_behind_plugin_as_update_available(self):
         repo = self._create_repo("check-plugin")
         record = PluginRecord("check-plugin", repo.resolve(), PluginState.LOCAL_ONLY, head="old", branch="main", upstream="origin/main", remote_name="origin", can_check=True)

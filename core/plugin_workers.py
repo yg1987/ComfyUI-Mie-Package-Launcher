@@ -41,7 +41,9 @@ class PluginTaskWorker(QtCore.QThread):
                 self._emit_results([])
                 return
             if self.task == "scan":
-                records = self.service.scan_local()
+                # First page load is intentionally cache-only.  Full Git and
+                # network inspection remains an explicit "refresh" action.
+                records = self.service.load_cached_records()
                 self._emit_results(records)
             elif self.task == "refresh":
                 records = self.service.refresh_all()

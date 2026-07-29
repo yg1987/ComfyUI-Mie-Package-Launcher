@@ -106,6 +106,8 @@ class PluginPage(BasePage):
         self._visible_records = []
         self._operation_buttons = []
         self._active_operation = None
+        # 更新/安装的明细要等列表刷新完成后再展示，避免关闭结果框后才开始刷新。
+        self._pending_operation_results = None
         self.page = 0
         self.page_size = 20
         self._setup_ui()
@@ -256,32 +258,26 @@ class PluginPage(BasePage):
         if not eligible:
             unchecked = [record for record in self.records if self._is_unchecked(record)]
             if unchecked:
-                listing = "\n".join(
-                    f"- {record.name}（{record.remote_url_display or '本地插件'}）"
-                    for record in unchecked
+                self._set_feedback(
+                    f"尚有 {len(unchecked)} 个插件未检查更新；请先点击“刷新”。",
+                    level="warning",
                 )
-                content = (
-                    "尚未完成插件更新检查，未执行任何更新操作。\n\n"
-                    f"待检查插件：{len(unchecked)} 个\n{listing}\n\n"
-                    "请先点击“刷新”，检查远端更新和依赖预检；检查完成后，页面会显示可更新数量。"
-                )
-                self._set_feedback("请先刷新检查插件更新。", level="warning")
-                self._show_copyable_details("请先检查更新", content)
                 return
             attention = [record for record in self.records if self._needs_attention(record)]
-            lines = [
-                "当前没有可安全更新的插件。",
-                f"已检查插件：{len(self.records)} 个",
-                f"需处理插件：{len(attention)} 个",
-            ]
             if attention:
-                lines.extend(("", "需处理插件："))
+                lines = [
+                    "当前没有可安全更新的插件。",
+                    f"已检查插件：{len(self.records)} 个",
+                    f"需处理插件：{len(attention)} 个",
+                    "",
+                    "需处理插件：",
+                ]
                 for record in attention:
                     lines.extend(("", self._status_details_text(record)))
+                self._set_feedback("没有可安全更新的插件；请查看需处理项目。", level="warning")
+                self._show_copyable_details("没有可更新的插件", "\n".join(lines))
             else:
-                lines.append("所有已检查的插件均已是最新版本。")
-            self._set_feedback("没有可更新的插件。")
-            self._show_copyable_details("没有可更新的插件", "\n".join(lines))
+                self._set_feedback("所有已检查的插件均已是最新版本。", level="success")
             return
         listing = "\n".join(f"- {record.name}（{record.remote_url_display or '本地插件'}）" for record in eligible)
         content = (
@@ -295,19 +291,18 @@ class PluginPage(BasePage):
 
     def _start_scan(self):
         self._active_operation = "scan"
-        self._set_feedback("正在检查本地插件列表…")
+        self._set_feedback("正在加载上次插件检查结果…")
         self.controller.start_scan()
 
-    def _start_refresh(self):
+    def _start_refresh(self, feedback=None):
         self._active_operation = "refresh"
-        self._set_feedback("正在检查插件更新…")
+        self._set_feedback(feedback or "正在检查插件更新…")
         self.controller.start_refresh()
 
     def _prepare_install(self):
         source_url = self.url_input.text().strip()
         if not source_url:
-            self._set_feedback("请输入完整的 Git 仓库地址。", level="error")
-            self._show_copyable_details("无法安装插件", "请先输入完整的 Git 仓库地址，例如：\nhttps://github.com/owner/repository.git")
+            self._set_feedback("请输入完整的 Git 仓库地址，例如：https://github.com/owner/repository.git", level="error")
             return
         self._active_operation = "prepare_install"
         self._set_feedback("正在校验插件地址并预检依赖…")
@@ -369,21 +364,42 @@ class PluginPage(BasePage):
         ):
             self.records = list(results)
             self._render_records(focus_table=True)
-            if getattr(self, "_active_operation", None) in {"scan", "refresh"}:
-                self._set_feedback(f"检查完成：共发现 {len(self.records)} 个插件，可更新 {sum(record.can_update for record in self.records)} 个。")
-            if hasattr(self, "_active_operation"):
+            pending = getattr(self, "_pending_operation_results", None)
+            if pending is not None:
+                operation, operation_results = pending
+                self._pending_operation_results = None
+                self._active_operation = None
+                self._show_operation_results(operation, operation_results, refreshed=True)
+            elif getattr(self, "_active_operation", None) == "scan":
+                checked_at = getattr(self.controller.service, "last_cached_at", None)
+                if checked_at:
+                    self._set_feedback(
+                        f"已加载上次插件检查结果（{checked_at}）：共 {len(self.records)} 个插件，可更新 {sum(record.can_update for record in self.records)} 个。"
+                    )
+                else:
+                    self._set_feedback(
+                        f"已加载本地插件列表：共 {len(self.records)} 个插件；尚未检查远端更新，请点击“刷新”。"
+                    )
+            elif getattr(self, "_active_operation", None) == "refresh":
+                self._set_feedback(
+                    f"刷新检查完成：共 {len(self.records)} 个插件，可更新 {sum(record.can_update for record in self.records)} 个；结果已保存。"
+                )
+            if hasattr(self, "_active_operation") and pending is None:
                 self._active_operation = None
         else:
             operation = self._active_operation or getattr(results[0], "operation", "操作")
-            self._show_operation_results(operation, results)
-            if operation == "update":
-                # 更新后重新检查远端与依赖预检，避免表格保留旧的“可更新”状态。
-                self._start_refresh()
+            self._pending_operation_results = (operation, results)
+            summary, _ = self._operation_summary(results)
+            label = {"update": "更新", "install": "安装", "uninstall": "卸载"}.get(operation, "操作")
+            if operation in {"update", "install"}:
+                # 先刷新远端与依赖预检，再展示完成结果；关闭弹窗后不会再有后台刷新。
+                self._start_refresh(f"{label}已完成：{summary}。正在刷新插件状态…")
             else:
                 self._start_scan()
 
     def _on_failed(self, message):
         self._active_operation = None
+        self._pending_operation_results = None
         self._set_feedback("操作失败；请查看完整错误信息。", level="error")
         self._show_copyable_details("插件管理操作失败", message)
 
@@ -392,8 +408,11 @@ class PluginPage(BasePage):
             button.setEnabled(not busy)
         for button in self._operation_buttons:
             button.setEnabled(not busy)
-        self.progress.setVisible(busy)
-        if busy:
+        # 初次加载只读缓存和目录，不需要用进度条打扰用户；手动刷新、
+        # 安装和更新等真正耗时的操作仍然照常显示。
+        show_progress = busy and getattr(self, "_active_operation", None) != "scan"
+        self.progress.setVisible(show_progress)
+        if show_progress:
             self.progress.setRange(0, 0)
 
     def _on_progress(self, result, current, total):
@@ -628,8 +647,26 @@ class PluginPage(BasePage):
         return "\n".join(details)
 
     def _show_copyable_details(self, title, content):
+        """显示可复制的长文本信息框。"""
+        self._show_details_dialog(title, content)
+
+    def _confirm_with_details(self, title, content, confirm_text, destructive=False):
+        """在长文本详情框中要求用户确认。"""
+        return self._show_details_dialog(
+            title,
+            content,
+            confirm_text=confirm_text,
+            destructive=destructive,
+        )
+
+    def _show_details_dialog(self, title, content, confirm_text=None, destructive=False):
+        """详情框：纯信息时关闭，预检确认时提供取消/确认。"""
+        content = (content or "").strip() or "没有可显示的详细信息。"
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(title)
+        dialog.setWindowFlags(
+            dialog.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint
+        )
         dialog.setModal(True)
         dialog.resize(760, 520)
         layout = QtWidgets.QVBoxLayout(dialog)
@@ -637,40 +674,58 @@ class PluginPage(BasePage):
         text.setReadOnly(True)
         text.setPlainText(content)
         text.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        colors = self.theme_manager.colors
+        text.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {colors.get('table_bg', '#111827')};
+                color: {colors.get('table_text', '#F9FAFB')};
+                border: 1px solid {colors.get('table_border', '#374151')};
+                selection-background-color: {colors.get('table_selected_bg', '#4F46E5')};
+                selection-color: {colors.get('table_selected_text', '#FFFFFF')};
+                font: 10pt 'Microsoft YaHei UI';
+            }}
+        """)
         layout.addWidget(text)
         buttons = QtWidgets.QHBoxLayout()
         copy_button = QtWidgets.QPushButton("复制全部信息")
+
         def copy_all():
             QtWidgets.QApplication.clipboard().setText(content)
             copy_button.setText("已复制")
             self._set_feedback("完整信息已复制。")
+
         copy_button.clicked.connect(copy_all)
-        close_button = QtWidgets.QPushButton("关闭")
-        close_button.clicked.connect(dialog.accept)
+        secondary_button = QtWidgets.QPushButton("取消" if confirm_text else "关闭")
+        secondary_button.clicked.connect(dialog.reject if confirm_text else dialog.accept)
         buttons.addStretch()
         buttons.addWidget(copy_button)
-        buttons.addWidget(close_button)
+        buttons.addWidget(secondary_button)
+        if confirm_text:
+            confirm_button = QtWidgets.QPushButton(confirm_text)
+            if destructive:
+                confirm_button.setStyleSheet("color: #EF4444;")
+            confirm_button.clicked.connect(dialog.accept)
+            buttons.addWidget(confirm_button)
         layout.addLayout(buttons)
-        dialog.exec_()
+        accepted = dialog.exec_() == QtWidgets.QDialog.Accepted
+        return accepted if confirm_text else None
 
-    def _confirm_with_details(self, title, content, confirm_text, destructive=False):
+    def _confirm_action(self, title, message, confirm_text, destructive=False):
+        """紧凑确认框：用于无需滚动、复制的单一动作。"""
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(title)
+        dialog.setWindowFlags(
+            dialog.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint
+        )
         dialog.setModal(True)
-        dialog.resize(760, 500)
         layout = QtWidgets.QVBoxLayout(dialog)
-        text = QtWidgets.QPlainTextEdit(dialog)
-        text.setReadOnly(True)
-        text.setPlainText(content)
-        text.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
-        layout.addWidget(text)
+        layout.setContentsMargins(24, 20, 24, 18)
+        message_label = QtWidgets.QLabel(message, dialog)
+        message_label.setWordWrap(True)
+        message_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        message_label.setMinimumWidth(400)
+        layout.addWidget(message_label)
         buttons = QtWidgets.QHBoxLayout()
-        copy_button = QtWidgets.QPushButton("复制全部信息")
-        def copy_all():
-            QtWidgets.QApplication.clipboard().setText(content)
-            copy_button.setText("已复制")
-            self._set_feedback("完整信息已复制。")
-        copy_button.clicked.connect(copy_all)
         cancel_button = QtWidgets.QPushButton("取消")
         confirm_button = QtWidgets.QPushButton(confirm_text)
         if destructive:
@@ -678,13 +733,33 @@ class PluginPage(BasePage):
         cancel_button.clicked.connect(dialog.reject)
         confirm_button.clicked.connect(dialog.accept)
         buttons.addStretch()
-        buttons.addWidget(copy_button)
         buttons.addWidget(cancel_button)
         buttons.addWidget(confirm_button)
         layout.addLayout(buttons)
+        dialog.adjustSize()
         return dialog.exec_() == QtWidgets.QDialog.Accepted
 
-    def _show_operation_results(self, operation, results):
+    def _operation_summary(self, results):
+        outcome_labels = {
+            "success": "成功",
+            "skipped": "已跳过",
+            "failed": "失败",
+            "cancelled": "已取消",
+        }
+        outcome_counts = {name: 0 for name in outcome_labels}
+        for result in results:
+            outcome = getattr(result, "outcome", "failed")
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        summary = "，".join(
+            f"{outcome_labels.get(outcome, outcome)} {count} 项"
+            for outcome, count in outcome_counts.items() if count
+        ) or "无返回结果"
+        level = "error" if outcome_counts.get("failed") else (
+            "warning" if outcome_counts.get("skipped") or outcome_counts.get("cancelled") else "success"
+        )
+        return summary, level
+
+    def _show_operation_results(self, operation, results, refreshed=False):
         operation_labels = {
             "update": "更新结果",
             "install": "安装结果",
@@ -696,11 +771,13 @@ class PluginPage(BasePage):
             "failed": "失败",
             "cancelled": "已取消",
         }
-        lines = []
-        outcome_counts = {name: 0 for name in outcome_labels}
+        lines = [
+            f"{operation_labels.get(operation, '操作结果')}已完成。",
+            "插件列表与状态已刷新。" if refreshed else "插件列表尚未刷新。",
+            "",
+        ]
         for result in results:
             outcome = getattr(result, "outcome", "failed")
-            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
             lines.extend((
                 f"插件：{getattr(result, 'plugin_name', '未知插件')}",
                 f"结果：{outcome_labels.get(outcome, outcome)}",
@@ -715,13 +792,7 @@ class PluginPage(BasePage):
             if getattr(result, "message", ""):
                 lines.extend(("完整说明：", result.message))
             lines.append("")
-        summary = "，".join(
-            f"{outcome_labels.get(outcome, outcome)} {count} 项"
-            for outcome, count in outcome_counts.items() if count
-        ) or "无返回结果"
-        level = "error" if outcome_counts.get("failed") else (
-            "warning" if outcome_counts.get("skipped") or outcome_counts.get("cancelled") else "success"
-        )
+        summary, level = self._operation_summary(results)
         self._set_feedback(f"{operation_labels.get(operation, '操作')}已完成：{summary}。", level=level)
         self._show_copyable_details(operation_labels.get(operation, "操作结果"), "\n".join(lines).rstrip())
 
@@ -730,7 +801,7 @@ class PluginPage(BasePage):
             f"将永久删除以下插件目录：\n{record.path}\n\n"
             "Python 依赖不会删除。此操作不可撤销；如需保留插件文件，请先手动备份。"
         )
-        if self._confirm_with_details("确认卸载插件", content, "卸载插件", destructive=True):
+        if self._confirm_action("确认卸载插件", content, "卸载插件", destructive=True):
             self._active_operation = "uninstall"
             self._set_feedback(f"正在卸载插件：{record.name}…")
             self.controller.start_uninstall(record)
