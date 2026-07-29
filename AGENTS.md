@@ -138,6 +138,37 @@ python __main__.py <command> [--json] [-v]
 
 ## Windows 正式构建与发布产物
 
+### GitHub Actions 正式发布：强制预检与收尾
+
+用户要求提交并发布时，**不得把 GitHub Actions 当作调试环境连续试错**。在首次推送前必须按顺序完成以下步骤；只有全部通过，才可推送并让 `my-changes` 的自动工作流发布：
+
+0. 先更新 `build_parameters.json` 的 `version`，并将它和本次产品代码一起提交。正式 Release 使用纯产品版本标签，**绝不附加** GitHub Actions 运行号。版本递增约定如下：
+   - 当前正式版本重置为 `v1.0.5`；下一次正式发布必须是 `v1.0.6`。
+   - 补丁号依次递增：`1.0.6`、`1.0.7`……`1.0.20`。
+   - 当补丁号已为 `20`，下一次为 `1.1.0`；之后按同样规则递增（例如 `1.1.20` 后为 `1.2.0`）。
+   - 本地测试包继续用 `ComfyUI启动器_v<版本>_<时间戳>_test.exe`，时间戳仅用于区分本地测试构建，不进入 GitHub Release 版本。
+1. 查阅最近的工作流结果和失败日志（如有）：
+   ```powershell
+   gh run list --repo yg1987/ComfyUI-Mie-Package-Launcher --workflow 'Build Windows release package' --limit 5
+   ```
+2. 本仓库为私有仓库，GitHub Hosted Runner 不能直接访问 Enigma 厂商 URL。工作流必须使用**私有预发布缓存** `enigma-v11.30-build20250428` 中的 `enigmavb-probe.bin`，通过 `gh release download`（携带 `GH_TOKEN: ${{ github.token }}`）下载，并在运行前以 `Get-AuthenticodeSignature` 验签。不得改回匿名 URL 或 `curl` 下载。
+3. 推送前在本机用同一条认证下载路径验证缓存资产；必须得到 7,946,496 字节、`Valid` 签名和 SHA-256 `AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35`：
+   ```powershell
+   gh release download enigma-v11.30-build20250428 `
+     --repo yg1987/ComfyUI-Mie-Package-Launcher --pattern 'enigmavb-probe.bin' `
+     --dir D:\CodexTools\temp --clobber
+   Get-AuthenticodeSignature D:\CodexTools\temp\enigmavb-probe.bin
+   Get-FileHash D:\CodexTools\temp\enigmavb-probe.bin -Algorithm SHA256
+   ```
+4. 用构建环境校验 workflow YAML，并运行 `git diff --check`：
+   ```powershell
+   & 'D:\CodexTools\launcher-build\Scripts\python.exe' -c "import yaml, pathlib; yaml.safe_load(pathlib.Path('.github/workflows/build-release.yml').read_text(encoding='utf-8'))"
+   ```
+5. 将所有已验证的代码与 workflow 改动合并为**一次**提交后再推送 `my-changes`；不要推送未经预检的中间 CI 修复。该分支上的 push 会自动触发正式发布。
+6. 推送后用 `gh run watch <run-id> --exit-status` 等到结束。只有运行成功后，才通过 `gh release view v<version>` 核对标签、目标提交、EXE 资产、大小与 SHA-256，再向用户宣布发布完成。
+
+若发布失败，先执行 `gh run view <run-id> --log-failed` 获取证据；在本机完成上述同等预检后才允许提交下一次修复，不能直接再推送猜测性改动。
+
 构建正式版 exe 时，**不要使用项目内的 `.venv`**；它可能缺少完整的 Nuitka / PyQt5 构建依赖。使用已验证的工具链：
 
 - 构建 Python：`D:\CodexTools\launcher-build\Scripts\python.exe`
@@ -155,7 +186,7 @@ $env:CL = '/utf-8'
 
 - 必须保留 `$env:CL = '/utf-8'`：项目的中文产品元数据会进入 Nuitka 自动生成的 C 头文件；缺少该选项时，MSVC 936 代码页可能报 `C4819` / `C2001: 常量中有换行符`。
 - **本机构建一律使用 `--test`**（也是脚本默认值），Release 文件名必须带 `_test.exe`；不要把本机验证包当正式发布物。
-- GitHub Actions 使用 `build.py --release` 生成正式包：exe 文件名不得含 `test`，并上传到 GitHub Release。正式 Release 标签会规范为单个 `v` 前缀（例如 `v1.0.14-build.21`）。
+- GitHub Actions 使用 `build.py --release` 生成正式包：exe 文件名不得含 `test`，并上传到 GitHub Release。正式 Release 标签为单个 `v` 前缀加产品版本（例如 `v1.0.15`），不含构建号或时间戳。
 - 构建会重建 `dist/ComfyUI启动器.dist`，并在 `release/` 生成单文件产物 `ComfyUI启动器_v<版本>_<时间戳>.exe`。这是正常且已授权的构建副作用。
 - 构建后至少确认产物存在、大小和 SHA-256，例如：
 
