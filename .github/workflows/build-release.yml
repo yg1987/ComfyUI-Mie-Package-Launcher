@@ -37,13 +37,14 @@ jobs:
           for ($attempt = 1; $attempt -le 3 -and -not $installed; $attempt++) {
             $installer = Join-Path $installerDir "enigmavb-$env:GITHUB_RUN_ID-$attempt.exe"
             try {
-              curl.exe --fail --location --retry 3 --retry-all-errors --connect-timeout 30 `
-                --output $installer 'https://enigmaprotector.com/assets/files/enigmavb.exe'
-              if ($LASTEXITCODE -ne 0) {
-                throw "Enigma installer download failed with exit code $LASTEXITCODE."
-              }
+              Invoke-WebRequest -Uri 'https://enigmaprotector.com/assets/files/enigmavb.exe' `
+                -OutFile $installer -MaximumRedirection 5 -ErrorAction Stop
               if ((Get-Item -LiteralPath $installer).Length -lt 1MB) {
                 throw 'The downloaded Enigma Virtual Box installer is unexpectedly small.'
+              }
+              $signature = Get-AuthenticodeSignature -FilePath $installer
+              if ($signature.Status -ne 'Valid') {
+                throw "The Enigma installer signature is not valid: $($signature.Status)."
               }
               Write-Host "Enigma installer attempt $attempt SHA-256: $((Get-FileHash -Path $installer -Algorithm SHA256).Hash)"
               Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -NoNewWindow -ErrorAction Stop
