@@ -10,6 +10,7 @@ from .about_me_page import AboutMePage
 from .about_comfyui_page import AboutComfyUIPage
 from .about_launcher_page import AboutLauncherPage
 from .plugin_page import PluginPage
+from .symlink_page import SymlinkPage
 
 __all__ = [
     'BasePage',
@@ -20,4 +21,5 @@ __all__ = [
     'AboutComfyUIPage',
     'AboutLauncherPage',
     'PluginPage',
+    'SymlinkPage',
 ]

@@ -42,6 +42,7 @@ from ui_qt.pages.about_comfyui_page import AboutComfyUIPage
 from ui_qt.pages.about_launcher_page import AboutLauncherPage
 from ui_qt.pages.plugins_page import PluginsPage, PluginController
 from ui_qt.pages.system_settings_page import SystemSettingsPage
+from ui_qt.pages.symlink_page import SymlinkPage
 from ui_qt.widgets.tray_icon import LauncherTray
 from ui_qt.log_viewer import LogViewerPage
 
@@ -2140,6 +2141,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             "plugin_versions": NavBtn("🧩 自用-插件管理"),
             "version": NavBtn("🧬 内核版本管理"),
             "models": NavBtn("📂 外置模型库管理"),
+            "symlinks": NavBtn("🔗 自用-软链接"),
             "tasks": NavBtn("📋 后台任务"),
             "settings": NavBtn("⚙️ 系统设置"),
             "about": NavBtn("👤 关于我"),
@@ -2156,6 +2158,8 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         btns["version"].setProperty("full_text", "🧬 内核版本管理")
         btns["models"].setToolTip("管理外置模型库路径配置")
         btns["models"].setProperty("full_text", "📂 外置模型库管理")
+        btns["symlinks"].setToolTip("为模型、输入、输出和工作流分别管理目录链接")
+        btns["symlinks"].setProperty("full_text", "🔗 自用-软链接")
         btns["settings"].setToolTip("启动器本体的窗口、托盘等设置")
         btns["settings"].setProperty("full_text", "⚙️ 系统设置")
         btns["about"].setToolTip("作者信息和相关链接")
@@ -2405,6 +2409,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         page_version = VersionPage(app=self, theme_manager=self.theme_manager)
         page_plugin_versions = PluginPage(app=self, theme_manager=self.theme_manager)
         page_models = ModelsPage(app=self, theme_manager=self.theme_manager)
+        page_symlinks = SymlinkPage(app=self, theme_manager=self.theme_manager)
         page_about_me = AboutMePage(theme_manager=self.theme_manager)
         page_about_comfyui = AboutComfyUIPage(theme_manager=self.theme_manager)
         page_about_launcher = AboutLauncherPage(
@@ -2429,6 +2434,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             "plugins": page_plugins,
             "plugin_versions": page_plugin_versions,
             "models": page_models,
+            "symlinks": page_symlinks,
             "settings": page_settings,
             "about": page_about_me,
             "comfyui": page_about_comfyui,
@@ -2524,6 +2530,7 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             ("plugin_versions", page_plugin_versions),
             ("version", page_version),
             ("models", page_models),
+            ("symlinks", page_symlinks),
             ("tasks", page_tasks),
             ("settings", page_settings),
             ("about", page_about_me),
@@ -3259,6 +3266,16 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
         except Exception:
             pass
 
+        # 6. 目录链接页：加载新环境独立配置与来源路径。
+        try:
+            symlink_page = pages.get("symlinks")
+            if symlink_page is not None and hasattr(
+                symlink_page, "reload_for_active_environment"
+            ):
+                symlink_page.reload_for_active_environment()
+        except Exception:
+            pass
+
     def has_active_background_tasks(self) -> bool:
         """是否有进行中的后台任务（环境切换前检查用）。
 
@@ -3371,6 +3388,37 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
             self._update_running = True
         except Exception:
             pass
+
+        # Git 操作开始前先检查目录链接，避免错误目标或非空普通目录与 checkout 冲突。
+        try:
+            from services.symlink_service import SymlinkService
+
+            link_service = SymlinkService(self)
+            link_statuses = link_service.ensure_active_links(repair=True)
+            link_attention = link_service.format_attention(link_statuses)
+            if link_attention:
+                self._update_running = False
+                DialogHelper.show_warning(
+                    self,
+                    "软链接需要处理",
+                    "更新前检查发现以下问题：\n\n"
+                    f"{link_attention}\n\n请前往“自用-软链接”页面处理后重试。",
+                    min_width=650,
+                )
+                if on_done:
+                    on_done()
+                return
+        except Exception as link_error:
+            self._update_running = False
+            DialogHelper.show_warning(
+                self,
+                "软链接检查失败",
+                f"更新前无法完成目录链接检查：{link_error}",
+                min_width=600,
+            )
+            if on_done:
+                on_done()
+            return
 
         # 如果用户没有勾选“同时更新依赖库”，提醒他一下并让他决定是否继续。
         # 他选择取消时要恢复按钮状态并返回，不走下面的流程。
@@ -3736,6 +3784,12 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                                     )
                             except Exception:
                                 pass
+                        try:
+                            symlink_page = getattr(self, "_new_pages", {}).get("symlinks")
+                            if symlink_page is not None:
+                                symlink_page.reload_for_active_environment()
+                        except Exception:
+                            pass
                 finally:
                     if not offered_force_update:
                         try:
@@ -3887,6 +3941,29 @@ class PyQtLauncher(QtWidgets.QMainWindow, process_events.ProcessCallback):
                 self.get_version_info("all")
             except Exception:
                 pass
+            try:
+                from services.symlink_service import SymlinkService
+
+                link_service = SymlinkService(self)
+                link_attention = link_service.format_attention(
+                    link_service.ensure_active_links(repair=True)
+                )
+                symlink_page = getattr(self, "_new_pages", {}).get("symlinks")
+                if symlink_page is not None:
+                    symlink_page.reload_for_active_environment()
+                if link_attention:
+                    DialogHelper.show_warning(
+                        self,
+                        "强制更新后的软链接需要处理",
+                        link_attention,
+                        min_width=650,
+                    )
+            except Exception as link_error:
+                try:
+                    if logger:
+                        logger.warning("强制更新后的软链接检查失败: %s", link_error)
+                except Exception:
+                    pass
             try:
                 self._update_running = False
             except Exception:

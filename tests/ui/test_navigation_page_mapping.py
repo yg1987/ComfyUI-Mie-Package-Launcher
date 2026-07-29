@@ -12,6 +12,7 @@ EXPECTED_PAGE_ENTRIES = [
     ("plugin_versions", "page_plugin_versions"),
     ("version", "page_version"),
     ("models", "page_models"),
+    ("symlinks", "page_symlinks"),
     ("tasks", "page_tasks"),
     ("settings", "page_settings"),
     ("about", "page_about_me"),

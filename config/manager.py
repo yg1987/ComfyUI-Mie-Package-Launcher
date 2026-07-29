@@ -114,6 +114,7 @@ class ConfigManager:
                 "update_timeout": 120,
                 "background_fetch_delay_seconds": 180,
             },
+            "symlink_manager": {"environments": {}},
         }
 
     def load_config(self) -> Dict[str, Any]:
@@ -164,6 +165,7 @@ class ConfigManager:
                     ui = self.config.setdefault("ui_settings", {})
                     ui.setdefault("minimize_to_tray_on_close", False)
                     ui.setdefault("minimize_to_tray_ask_every_time", True)
+                    self.config.setdefault("symlink_manager", {"environments": {}})
                     # 多环境迁移：老 paths 段 → environments 数组 + active_env_id
                     try:
                         migrate_environments(self.config)

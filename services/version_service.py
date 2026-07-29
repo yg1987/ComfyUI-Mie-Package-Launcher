@@ -21,6 +21,16 @@ class VersionService(IVersionService):
         self._process_lock = threading.Lock()
         self._git_network_lock = threading.Lock()
 
+    def _ensure_directory_links(self) -> str:
+        """Safely repair configured links and return attention text, if any."""
+        try:
+            from services.symlink_service import SymlinkService
+
+            service = SymlinkService(self.app)
+            return service.format_attention(service.ensure_active_links(repair=True))
+        except Exception as exc:
+            return f"目录链接检查失败: {exc}"
+
     def refresh(self, scope: str = "all") -> None:
         from core.version_service import refresh_version_info
 
@@ -753,6 +763,14 @@ class VersionService(IVersionService):
             on_progress: 进度回调函数
         """
 
+        link_attention = self._ensure_directory_links()
+        if link_attention:
+            return {
+                "component": "core",
+                "error_code": "SYMLINKS_NEED_ATTENTION",
+                "error": f"目录链接需要处理:\n{link_attention}",
+            }
+
         def report(status: str):
             if on_progress:
                 try:
@@ -936,6 +954,15 @@ class VersionService(IVersionService):
                     after_hash = ""
 
                 updated = bool(before_hash and after_hash and before_hash != after_hash)
+                link_attention = self._ensure_directory_links()
+                if link_attention:
+                    return {
+                        "component": "core",
+                        "updated": updated,
+                        "branch": br,
+                        "error_code": "SYMLINKS_NEED_ATTENTION",
+                        "error": f"更新完成，但目录链接需要处理:\n{link_attention}",
+                    }
                 return {"component": "core", "updated": updated, "branch": br}
             except Exception as e:
                 return {"component": "core", "error": str(e)}
@@ -943,6 +970,13 @@ class VersionService(IVersionService):
     def upgrade_to_commit(
         self, commit: str, stable_only: bool = False
     ) -> Dict[str, Any]:
+        link_attention = self._ensure_directory_links()
+        if link_attention:
+            return {
+                "component": "core",
+                "error_code": "SYMLINKS_NEED_ATTENTION",
+                "error": f"目录链接需要处理:\n{link_attention}",
+            }
         if stable_only:
             # 检查该提交是否对应稳定标签
             tags = self._list_tags()
@@ -970,6 +1004,14 @@ class VersionService(IVersionService):
                 cwd=self._repo_root(),
             )
             if r and r.returncode == 0:
+                link_attention = self._ensure_directory_links()
+                if link_attention:
+                    return {
+                        "component": "core",
+                        "updated": True,
+                        "error_code": "SYMLINKS_NEED_ATTENTION",
+                        "error": f"版本已切换，但目录链接需要处理:\n{link_attention}",
+                    }
                 return {"component": "core", "updated": True}
             return {"component": "core", "error": r.stderr if r else "checkout failed"}
         except Exception as e:
@@ -986,6 +1028,14 @@ class VersionService(IVersionService):
                 cwd=self._repo_root(),
             )
             if r and r.returncode == 0:
+                link_attention = self._ensure_directory_links()
+                if link_attention:
+                    return {
+                        "component": "core",
+                        "updated": True,
+                        "error_code": "SYMLINKS_NEED_ATTENTION",
+                        "error": f"版本已切换，但目录链接需要处理:\n{link_attention}",
+                    }
                 return {"component": "core", "updated": True}
             # Tag 不在本地，fetch 单个 tag 后重试
             try:
@@ -1002,6 +1052,14 @@ class VersionService(IVersionService):
                     cwd=self._repo_root(),
                 )
                 if r and r.returncode == 0:
+                    link_attention = self._ensure_directory_links()
+                    if link_attention:
+                        return {
+                            "component": "core",
+                            "updated": True,
+                            "error_code": "SYMLINKS_NEED_ATTENTION",
+                            "error": f"版本已切换，但目录链接需要处理:\n{link_attention}",
+                        }
                     return {"component": "core", "updated": True}
             except Exception:
                 pass

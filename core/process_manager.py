@@ -168,6 +168,32 @@ class ProcessManager:
 
     def start_comfyui(self):  #
         try:
+            # 启动前确保所有已启用目录链接仍然有效。仅自动处理来源不存在或
+            # 空目录的安全状态；任何含文件目录、断链或错误目标都会阻止启动。
+            try:
+                from services.symlink_service import SymlinkService
+
+                link_service = SymlinkService(self.app)
+                link_statuses = link_service.ensure_active_links(repair=True)
+                link_attention = link_service.format_attention(link_statuses)
+                if link_attention:
+                    message = (
+                        "以下目录链接需要先处理，已取消启动：\n\n"
+                        f"{link_attention}\n\n请前往“自用-软链接”页面检查。"
+                    )
+                    self._show_error("软链接需要处理", message)
+                    self.on_start_failed(message)
+                    return
+            except Exception as link_error:
+                message = f"软链接启动前检查失败，已取消启动：{link_error}"
+                try:
+                    self.app.logger.error(message, exc_info=True)
+                except Exception:
+                    pass
+                self._show_error("软链接检查失败", message)
+                self.on_start_failed(message)
+                return
+
             # 设置正在启动状态
             self.app._launching = True
             try:
