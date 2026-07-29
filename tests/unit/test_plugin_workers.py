@@ -327,6 +327,48 @@ class TestPluginWorkers(unittest.TestCase):
         finally:
             page.close()
 
+    def test_update_button_is_always_visible_and_reports_when_current(self):
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        record = PluginRecord(
+            "example-plugin", Path("example-plugin"), PluginState.UP_TO_DATE,
+            update_availability=UpdateAvailability.UP_TO_DATE,
+        )
+        try:
+            page.records = [record]
+            page.controller.start_update = Mock()
+            page._render_records()
+
+            actions = page.table.cellWidget(0, 7).layout()
+            self.assertEqual(actions.itemAt(0).widget().text(), "更新")
+            self.assertEqual(actions.itemAt(1).widget().text(), "卸载")
+
+            actions.itemAt(0).widget().click()
+            self.assertEqual(page.feedback_label.text(), "example-plugin 已是最新版本，无需更新。")
+            page.controller.start_update.assert_not_called()
+        finally:
+            page.close()
+
+    def test_completed_update_refreshes_remote_status(self):
+        service = SimpleNamespace(refresh_all=lambda: [])
+        app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))
+        page = PluginPage(app_context, ThemeManager())
+        result = SimpleNamespace(operation="update", plugin_name="example-plugin")
+        try:
+            page._active_operation = "update"
+            page._show_operation_results = Mock()
+            page._start_refresh = Mock()
+            page._start_scan = Mock()
+
+            page._on_finished([result])
+
+            page._show_operation_results.assert_called_once_with("update", [result])
+            page._start_refresh.assert_called_once()
+            page._start_scan.assert_not_called()
+        finally:
+            page.close()
+
     def test_busy_state_disables_row_operations(self):
         service = SimpleNamespace(refresh_all=lambda: [])
         app_context = SimpleNamespace(services=SimpleNamespace(plugin_versions=service))

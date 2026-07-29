@@ -314,6 +314,14 @@ class PluginPage(BasePage):
         self.controller.start_prepare_install(source_url)
 
     def _start_update_one(self, record):
+        if not record.can_update:
+            if record.update_availability == UpdateAvailability.UP_TO_DATE:
+                self._set_feedback(f"{record.name} 已是最新版本，无需更新。")
+            elif self._is_unchecked(record):
+                self._set_feedback(f"{record.name} 尚未完成更新检查，请先点击“刷新”。", level="warning")
+            else:
+                self._set_feedback(f"{record.name} 当前无法安全更新，请先查看状态说明。", level="warning")
+            return
         self._active_operation = "update"
         self._set_feedback(f"正在更新插件：{record.name}…")
         self.controller.start_update([record])
@@ -368,7 +376,11 @@ class PluginPage(BasePage):
         else:
             operation = self._active_operation or getattr(results[0], "operation", "操作")
             self._show_operation_results(operation, results)
-            self._start_scan()
+            if operation == "update":
+                # 更新后重新检查远端与依赖预检，避免表格保留旧的“可更新”状态。
+                self._start_refresh()
+            else:
+                self._start_scan()
 
     def _on_failed(self, message):
         self._active_operation = None
@@ -456,13 +468,12 @@ class PluginPage(BasePage):
             actions = QtWidgets.QHBoxLayout(action)
             actions.setContentsMargins(4, 4, 4, 4)
             actions.setSpacing(6)
-            if record.can_update:
-                button = QtWidgets.QPushButton("更新")
-                button.clicked.connect(lambda _=False, item=record: self._start_update_one(item))
-                button.setMinimumSize(64, 28)
-                button.setEnabled(not self.controller.is_busy())
-                actions.addWidget(button)
-                self._operation_buttons.append(button)
+            button = QtWidgets.QPushButton("更新")
+            button.clicked.connect(lambda _=False, item=record: self._start_update_one(item))
+            button.setMinimumSize(64, 28)
+            button.setEnabled(not self.controller.is_busy())
+            actions.addWidget(button)
+            self._operation_buttons.append(button)
             remove = QtWidgets.QPushButton("卸载")
             remove.clicked.connect(lambda _=False, item=record: self._confirm_uninstall(item))
             remove.setMinimumSize(64, 28)

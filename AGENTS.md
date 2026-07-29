@@ -2,6 +2,24 @@
 
 > 本文件是 agent 操作本启动器的入口。完整 CLI 契约见 [`docs/cli.md`](docs/cli.md)。
 
+## 强制会话预检（不可跳过）
+
+**任何代码搜索、读取、测试、构建或修改之前，先完整阅读本文件。** 当前工作目录可能位于本仓库上级；即便外层存在工作区规则，也必须继续读取到本项目的这份 `AGENTS.md`。
+
+本机已配置可用工具链，禁止只检查项目 `.venv` 后就声称依赖不存在：
+
+- GUI / PyQt5 测试：`D:\CodexTools\pyqt5-test\Scripts\python.exe`
+- 正式构建：`D:\CodexTools\launcher-build\Scripts\python.exe`
+- Enigma：`D:\CodexTools\EnigmaVirtualBox\enigmavbconsole.exe`
+
+运行 Qt 测试时，必须先使用 GUI 测试 Python，例如：
+
+```powershell
+& 'D:\CodexTools\pyqt5-test\Scripts\python.exe' -m unittest tests.unit.test_plugin_workers -v
+```
+
+只有上述可执行文件或命令实际失败，才能报告测试环境不可用，并附失败证据；不得以项目 `.venv` 缺少 PyQt5 作为结论。
+
 ## 这是什么
 
 ComfyUI 启动器（PyQt5，Windows）。无参数启动 = GUI 图形界面；带子命令 = headless CLI，
