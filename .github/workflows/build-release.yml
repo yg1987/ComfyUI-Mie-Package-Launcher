@@ -82,9 +82,9 @@ jobs:
         shell: pwsh
         run: |
           python -X utf8 build.py --release
-          $release = Get-ChildItem -Path release -Filter '*.exe' -File -Recurse -ErrorAction SilentlyContinue
-          if (-not $release) {
-            throw 'The formal release executable was not created.'
+          $release = @(Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue)
+          if ($release.Count -ne 1) {
+            throw "Expected exactly one standalone EXE in release/, found $($release.Count)."
           }
 
       - name: Upload formal release artifact
@@ -102,5 +102,8 @@ jobs:
         run: |
           $version = ((Get-Content -Raw build_parameters.json | ConvertFrom-Json).version).TrimStart('v', 'V')
           $tag = "v$version"
-          $release = Get-ChildItem -Path release -Filter '*.exe' -File | Select-Object -First 1
+          $release = @(Get-ChildItem -Path release -Filter '*.exe' -File)
+          if ($release.Count -ne 1) {
+            throw "Expected exactly one standalone EXE to publish, found $($release.Count)."
+          }
           gh release create $tag $release.FullName --target $env:GITHUB_SHA --title "ComfyUI启动器 v$version" --generate-notes

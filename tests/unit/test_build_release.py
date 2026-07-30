@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import build
+import release
 
 
 class TestBuildReleaseName(unittest.TestCase):
@@ -65,6 +66,29 @@ class TestBuildReleaseName(unittest.TestCase):
     @patch("sys.argv", ["build.py", "--release"])
     def test_release_flag_selects_formal_channel(self):
         self.assertFalse(build.parse_args().test)
+
+    def test_manual_release_lists_only_root_level_exe(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_dir = root / "release"
+            release_dir.mkdir()
+            standalone = release_dir / "ComfyUI启动器_v1.0.17_20260730_120000.exe"
+            standalone.write_bytes(b"exe")
+            nested = release_dir / "package"
+            nested.mkdir()
+            (nested / "ComfyUI启动器.exe").write_bytes(b"nested")
+            (release_dir / "ComfyUI启动器_v1.0.17.zip").write_bytes(b"zip")
+
+            with patch("release.get_project_dir", return_value=str(root)):
+                self.assertEqual(release.list_exe_files(), [str(standalone)])
+
+    def test_workflow_requires_one_root_level_exe(self):
+        workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "build-release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("release/*.exe", workflow)
+        self.assertIn("$release.Count -ne 1", workflow)
+        self.assertNotIn("-Filter '*.zip'", workflow)
 
 
 if __name__ == "__main__":

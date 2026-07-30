@@ -185,7 +185,8 @@ class TestMultiSegmentLine(unittest.TestCase):
         """单行多 \r:count = \r 个数,但 live emit 只含最后一段文本,
         不能把整条超长串塞进 marker(原 bug:emit 2KB 乱码)。"""
         f = ProgressCollapseFilter()
-        segments = [f"tracking: {i}%|{'\u2588'*(i//10)}| {i}/81" for i in range(0, 82)]
+        block = "\u2588"
+        segments = [f"tracking: {i}%|{block * (i // 10)}| {i}/81" for i in range(0, 82)]
         progress_line = "\r".join(segments)
         # 单行多 \r 在 burst 中被速率限,只 emit 一条
         out = f.feed(progress_line)
